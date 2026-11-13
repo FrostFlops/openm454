@@ -611,23 +611,29 @@ class Scope:
         send = prog
         if cross and cross == self._last_cross:
             send = [w for w in prog if w[0] not in CROSS_REGS]
-        self._last_cross = None
-        settle, self._overdriven = (OVERDRIVE_SETTLE if self._overdriven else 0.0), False
+        settle = OVERDRIVE_SETTLE if self._overdriven else 0.0
         analog_on = bool(geom.get('analog_rate'))
         if analog_on and not self._analog_awake:     # analog side idle before (or unknown): front end recovers
             settle = max(settle, ANALOG_WAKE_SETTLE)
-        self._analog_awake = analog_on
         pkt = geom['pkt_bytes']
         if not geom.get('repeat'):        # repeat: one frame per transfer, a larger read would merge two frames
             # Linux/xHCI: an EP 0x86 read that is not a multiple of the max packet ends in -EOVERFLOW as soon as a
             # 1024-byte packet no longer fits the remaining buffer (the stream is byte-continuous, so a larger read
             # is harmless)
             pkt = (pkt + EP_MAX_PACKET - 1) // EP_MAX_PACKET * EP_MAX_PACKET
-        raw = self.engine.run(send, pkt_bytes=pkt, need_bytes=geom['need_bytes'],
-                              n_transfers=geom.get('transfer_count', 16), trigger_timeout=trigger_timeout,
-                              collect_timeout=collect_timeout, settle=settle, **kw)
-        if cross:
-            self._last_cross = cross
+        # The three caches are committed only after the engine ran: a run refused before the setup program
+        # (USB_NO_MEM) or one that failed while writing must not make the next run skip the front-end waits or
+        # forget an overdriven input.
+        try:
+            raw = self.engine.run(send, pkt_bytes=pkt, need_bytes=geom['need_bytes'],
+                                  n_transfers=geom.get('transfer_count', 16), trigger_timeout=trigger_timeout,
+                                  collect_timeout=collect_timeout, settle=settle, **kw)
+        except BaseException:
+            self._last_cross = None       # unknown how far the writes got: rewrite the CROSS tables next time
+            raise
+        self._last_cross = cross or None
+        self._overdriven = False
+        self._analog_awake = analog_on
         return raw
 
     def stream(self, st, every=1.0, emit=None, stop_flag=None, build=True, live=True):

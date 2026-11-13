@@ -235,3 +235,47 @@ def test_digital_pulse_trigger_needs_no_level():
     st = settings_from_args(cli.build_parser().parse_args(['capture', '-c', 'D4', '--trig', 'D4:npulse>:200us']))
     assert (st.trig_source, st.trig_edge, st.trig_level) == ('D4', 'npulse>', None)
     assert abs(st.trig_pulse - 200e-6) < 1e-12
+
+
+class RefusingEngine:
+    """The USB_NO_MEM precheck of openm454.acquire: refuses before the setup program writes anything."""
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, prog, **kw):
+        self.calls.append(kw)
+        raise DscopeError('USB_NO_MEM', 'refusing this capture before the setup program', 'raise usbfs_memory_mb')
+
+
+def geom(**kw):
+    g = {'pkt_bytes': 16384, 'need_bytes': 65536, 'transfer_count': 4, 'analog_rate': 100e6, 'record_s': 5e-3,
+         'repeat': False}
+    g.update(kw)
+    return g
+
+
+def test_a_refused_run_leaves_the_front_end_state_alone():
+    """Nothing was written and nothing was waited for, so the next run must still pay the wake and overdrive waits."""
+    s = scope_with(None)
+    s.engine = RefusingEngine()
+    s._analog_awake, s._overdriven, s._last_cross = False, True, [(0x44, 1)]
+    with pytest.raises(DscopeError) as ei:
+        s._run([(0x44, 1), (0x10, 0x1234)], geom(), 1.0, None)
+    assert ei.value.code == 'USB_NO_MEM'
+    assert s._analog_awake is False and s._overdriven is True     # untouched: no analog wake, overdrive unknown
+    assert s._last_cross is None                                  # write progress unknown: rewrite the tables
+
+
+def test_a_finished_run_commits_the_front_end_state():
+    raw = RawCapture()
+    raw.head = head()
+    s = scope_with(raw)
+    s._analog_awake, s._overdriven = False, True
+    prog = [(0x44, 1), (0x10, 0x1234)]
+    s._run(prog, geom(), 1.0, None)
+    assert s.engine.calls[0]['settle'] == max(scopemod.OVERDRIVE_SETTLE, scopemod.ANALOG_WAKE_SETTLE)
+    assert s._analog_awake is True and s._overdriven is False
+    assert s._last_cross == [(0x44, 1)]                           # written: the next run may skip them
+    s._run(prog, geom(), 1.0, None)
+    assert s.engine.calls[1]['settle'] == 0.0                     # awake and not overdriven: no wait
