@@ -351,7 +351,8 @@ class Job:
 A_KEYS = ('freq_hz', 'vpp_v', 'vmin_v', 'vmax_v', 'vmean_v', 'duty_pct', 'rise_s', 'fall_s')
 D_KEYS = ('state', 'freq_hz', 'duty_pct', 'edges', 'high_frac')
 ACQ_KEYS = ('triggered', 'trigger_check', 'trigger_misfires', 'mode', 'analog_rate_hz', 'digital_rate_hz', 'rate_hz',
-            'samples', 'duration_s', 'complete', 'stop_reason', 'host_mb_s', 'backlog_max_mb', 'unread_at_stop_mb')
+            'samples', 'duration_s', 'complete', 'stop_reason', 'transfers', 'host_mb_s', 'backlog_max_mb',
+            'unread_at_stop_mb')
 ACQ_SKIP = {'trigger_check': ('unchecked',), 'trigger_misfires': (0,)}       # left out of summaries when uneventful
 LONG_TEXT = 400
 PLAN_KEYS = ('rate_hz', 'channels', 'data_mb_s', 'verdict', 'readout_mb_s', 'gapfree_max_s', 'recommendation',
