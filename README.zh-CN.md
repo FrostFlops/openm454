@@ -471,6 +471,7 @@ claude mcp add -s user openm454 -e "OPENM454_DSWAVE=<folder>" -- openm454-mcp
 | `TRIGGER_OUT_OF_RANGE` | 2 | 触发电平超出该通道的可见范围(信息中会给出范围);仅限 normal 和 auto 模式(使用 `--trig-mode force` 时不使用触发,电平会被限幅) |
 | `FIRMWARE_SOURCE` | 6 | 未找到 DSWave 1.2.1(或文件不是 1.2.1),因此无法提取 FPGA 比特流;信息列出了搜索过的位置,提示中给出 `openm454 setup --dswave <folder>` |
 | `UNSUPPORTED` | 6 | 示波器以 USB 2 速度连接;capture、watch、stream 和 log 需要 USB 3(SuperSpeed)连接 |
+| `USB_NO_MEM` | 6 | 仅 Linux:一次 capture 排队的读取放不进内核 usbfs 缓冲(`usbfs_memory_mb`,默认 16 MiB,所有 USB 设备共用)。本次 capture 自己就超限时在 setup 程序之前抛出,被其他进程占去一部分时在 submit 时抛出;信息里是排队的字节数和当前上限,提示里给出改法 |
 | `INVALID_ARG` | 2 | 某个参数有误,或对该通道组合不可行,或 `log --hook` 的文件无法使用(缺失、语法或导入错误、没有 `process()`) |
 | `STREAM_BETTER`、`NEEDS_FORCE` | 2 | `log` 超过了它的无间隙上限(见上文) |
 | `HOOK_ERROR` | 2 | `log --hook`:钩子文件在 `setup()`、`process()` 或 `finish()` 中抛出异常,或 `process()` 返回了 `None` 和 dict 之外的东西;对 `process()` / `finish()`,`error.trace` 给出回溯的末尾部分,此前已记录的数据会保留;`setup()` 失败时不会记录任何数据 |
