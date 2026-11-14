@@ -798,7 +798,8 @@ class Scope:
         acq = {'analog_rate_hz': geom.get('analog_rate'), 'digital_rate_hz': geom.get('digital_rate'),
                'samples': n, 'duration_s': n / rate if rate else 0.0,
                'triggered': bool(raw.triggered), 'attempts': attempts,
-               'stop': getattr(raw, 'stop', None), 'handshakes': len(getattr(raw, 'handshakes', [])),
+               'stop': getattr(raw, 'stop', None), 'transfers': getattr(raw, 'transfers', None),
+               'handshakes': len(getattr(raw, 'handshakes', [])),
                'complete': self._check_complete(raw, geom),
                'digital_samples': n_d if frame['digital'] else None,
                'elapsed_ms': round((time.time() - t_begin) * 1000)}

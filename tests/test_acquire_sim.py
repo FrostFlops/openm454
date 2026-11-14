@@ -733,15 +733,50 @@ def test_a_zero_limit_means_unlimited(monkeypatch):
 
 
 def test_a_capture_larger_than_the_usbfs_buffer_is_refused_before_the_setup_program(monkeypatch):
-    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 1)       # 1 MiB, smaller than a stock Linux's 16
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 1)       # 1 MiB: not even 4 reads of 256 KiB fit
     sim, eng = engine()
     with pytest.raises(DscopeError) as ei:
-        eng.run(SETUP, pkt_bytes=128 * 1024, need_bytes=128 * 1024, n_transfers=16, trigger_timeout=1.0)
+        eng.run(SETUP, pkt_bytes=256 * 1024, need_bytes=256 * 1024, n_transfers=16, trigger_timeout=1.0)
     assert ei.value.code == 'USB_NO_MEM' and ei.value.exit_code == 6
-    assert '2101248 B' in ei.value.message and '1 MiB' in ei.value.message    # 16 x 128 KiB + the 4 KiB head
+    assert '4198400 B' in ei.value.message and '1 MiB' in ei.value.message    # 16 x 256 KiB + the 4 KiB head
     assert 'usbfs_memory_mb' in ei.value.hint
     assert sim.log == [] and sim.pending == []                   # refused before any write: the device is untouched
     assert not eng.t.running and not eng.t.failed
+
+
+def test_a_small_usbfs_budget_lowers_the_queue_depth(monkeypatch):
+    """A budget that cannot hold the geometry's queue uses what fits (>= 4) instead of failing the run."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 8)       # 8 MiB: the head + 7 reads of 1 MiB fit
+    sim, eng = engine()
+    cap = eng.run(SETUP, pkt_bytes=1024 * 1024, need_bytes=4 * 1024 * 1024, n_transfers=16, trigger_timeout=1.0)
+    assert cap.transfers == 7 and len(eng._trs) == 8            # head + 7 data reads
+    assert cap.stop == 'normal' and sim.violations == []
+
+
+def test_a_budget_that_holds_the_queue_keeps_it(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 1000)
+    sim, eng = engine()
+    cap = eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=16, trigger_timeout=1.0)
+    assert cap.transfers == 16 and len(eng._trs) == 17
+
+
+def test_the_streaming_path_uses_the_budget_too(monkeypatch):
+    """log/stream (keep_data=False, no record end): the same cap, and the run still ends on the stop flag."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 8)
+    sim, eng = engine()
+    got = []
+    cap = eng.run(SETUP, pkt_bytes=1024 * 1024, need_bytes=None, n_transfers=16, trigger_timeout=1.0,
+                  collect_timeout=None, on_chunk=got.append, stop_flag=lambda: len(got) > 12, poll=False,
+                  keep_data=False)
+    assert cap.transfers == 7 and cap.stop == 'normal' and cap.stopped and len(cap.data) == 0
+    assert sim.violations == [] and sim.pending == []
+
+
+def test_no_usbfs_keeps_the_requested_depth(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: None)   # Windows, macOS
+    sim, eng = engine()
+    cap = eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=16, trigger_timeout=1.0)
+    assert cap.transfers == 16
 
 
 def test_submit_no_mem_names_the_usbfs_limit(monkeypatch):

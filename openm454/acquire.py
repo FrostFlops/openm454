@@ -43,6 +43,7 @@ from .errors import DscopeError
 from .transport import HINT_REOPEN, HINT_USBFS, usbfs_memory_mb
 
 HEAD_BYTES = 4096
+MIN_TRANSFERS = 4                 # fewer queued reads starve the pipe on a slow host (same floor as the readout probe)
 HEAD_MAGIC = b'\x55\x55\x55\x55'
 EP_DATA = 0x86
 GAP_BETWEEN_RUNS = 0.100       # FUN_14033f270: 100 ms before every run
@@ -63,6 +64,22 @@ _STATUS = {usb1.TRANSFER_COMPLETED: 'COMPLETED', usb1.TRANSFER_ERROR: 'ERROR', u
 def _queued_bytes(pkt_bytes, n_transfers):
     """What a run submits at once: the head read plus every data read (the kernel charges each of them in full)."""
     return HEAD_BYTES + n_transfers * pkt_bytes
+
+
+def _transfers_for(limit_mb, pkt_bytes, want):
+    """How many EP 0x86 reads to queue. Only a usbfs budget that cannot hold `want` changes the answer: then as many
+    as fit, never fewer than MIN_TRANSFERS. -> None when not even the floor fits: the caller refuses the run.
+
+    The floor is not cosmetic: it keeps a slow host from starving the pipe with one outstanding read, and
+    logger.measure_readout() already raises the queue to 4 for its small-packet probe. Measured 2026-11-13 (DSCope
+    M454, 12 ch, 1 MiB reads): a bench-limited queue of 4 reads reaches the same 204 MB/s as 16, and N=2 reaches it
+    too, so lowering the depth costs nothing that this host can see."""
+    if not limit_mb:                         # no usbfs (Windows, macOS) or 0 = no limit: nothing to adapt
+        return want
+    n = (limit_mb * 1024 * 1024 - HEAD_BYTES) // pkt_bytes
+    if n >= want:
+        return want
+    return int(n) if n >= MIN_TRANSFERS else None
 
 
 def _usbfs_error(what, pkt_bytes, n_transfers, limit):
@@ -89,6 +106,7 @@ class RawCapture:
         self.progress = []        # raw R 0x02 values from the progress polls
         self.stop = None          # 'normal' | 'error' | None (never started)
         self.error = None
+        self.transfers = None     # EP 0x86 reads queued at once (the engine lowers it when the usbfs budget is small)
 
     @property
     def head_words(self):
@@ -253,11 +271,13 @@ class Engine:
     def _run(self, setup_writes, pkt_bytes, need_bytes, n_transfers, trigger_timeout, collect_timeout,
              repeat_frames, on_chunk, stop_flag, poll, settle=0.0, keep_data=True):
         t = self.t
-        limit = usbfs_memory_mb()          # Linux only (0 = no limit): checked before the setup program
-        # a lower bound: the kernel also charges a few hundred bytes per URB, and other processes share the limit
-        if limit and _queued_bytes(pkt_bytes, n_transfers) > limit * 1024 * 1024:
-            raise _usbfs_error('refusing this capture before the setup program', pkt_bytes, n_transfers, limit)
+        limit = usbfs_memory_mb()          # Linux only (0 = no limit): decided before the setup program
+        wanted = n_transfers
+        n_transfers = _transfers_for(limit, pkt_bytes, wanted)
+        if n_transfers is None:            # not even the floor fits: refuse, the device stays untouched
+            raise _usbfs_error('refusing this capture before the setup program', pkt_bytes, wanted, limit)
         cap = RawCapture()
+        cap.transfers = n_transfers
         self._events = collections.deque()
         self._stopping = False
         self._full = False
