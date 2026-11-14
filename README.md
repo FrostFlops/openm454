@@ -100,6 +100,21 @@ Measured on the M454 over USB 3 with every input on a 1 kHz square, every period
   `state/host.json`); `log` takes its defaults from there. Measured here: decode 468 MB/s, USB readout 206 MB/s
   (4 analog + 8 digital) / 267 MB/s (2 analog + 8 digital).
 
+### Repeat mode (`capture --repeat N`)
+
+`capture --repeat N` collects N back-to-back frames in one start: the device re-arms between frames (register 0x00
+`HW_BASE_MODE` = 1) instead of the host starting a run per capture, which costs ~180 ms of protocol spacing.
+
+- One trigger setting only: repeat re-arms in hardware, so the mode is forced (`--trig-mode force`). Asking for a
+  triggered start is refused (`INVALID_ARG`) rather than silently recording one frame.
+- Each frame is decoded on its own: `Capture.frames` holds one dict per frame (analog, digital, `trig_index`).
+  `--measure`, the PNG and the NPZ describe the first frame. Bytes a frame carries beyond its record are device
+  buffer content, not signal, and are cut by the frame's tail.
+- Measured (1 analog channel, 5 us window at 400 MSa/s, 2048 samples per frame, every frame decoded): 2000 frames in
+  one start took 85 ms of frame time beyond the 380 ms setup, i.e. ~24 kframes/s including decode - 4500x the 5.26
+  frames/s of repeated single captures. The transfer alone reaches 31 kframes/s (32 us per frame, 256 MB/s); the
+  frame size has an 8192-byte floor, so 100 MSa/s tops out at ~17.5 kframes/s.
+
 ### Above the readout limit: how `log` decides
 
 D = the data rate; R = how fast this PC reads the scope while it acquires. R depends on the channel set (measured

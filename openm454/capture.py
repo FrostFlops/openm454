@@ -22,6 +22,7 @@ class Capture:
         self.meta = meta                   # dict (JSON-serialisable)
         self.analog = analog or {}         # 'A1' -> uint8 codes
         self.digital = digital or {}       # 'D0' -> uint8 0/1
+        self.frames = None                 # repeat mode: one decoded dict per frame, the first one also in .analog
         self._measured = {}                # (ch, edges_n, window) -> result (the data never changes)
 
     # ---------------------------------------------------------------- scaling / time

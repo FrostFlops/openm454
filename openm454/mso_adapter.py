@@ -99,17 +99,44 @@ def compile(hal, zero_info, include_cross=True):
 def decode(raw, geom, hal):
     """Raw capture -> per-channel arrays cropped to [trigger - pretrigger, + depth), times relative to the trigger."""
     from . import packet
-    regs = geom['_regs']
-    rates = {'analog': geom['analog_rate'], 'digital': geom['digital_rate']}
-    layout = packet.layout_from_regs(regs, rates=rates, trig_domain=geom['trig_domain'])
+    layout = _layout(geom)
     head = packet.parse_head(raw.head)
-    data = bytes(raw.data)
+    trig = packet.trigger_index(head, layout) if head.get('triggered') else None
+    return _decode_bytes(bytes(raw.data), geom, hal, layout, trig)
+
+
+def decode_frames(raw, geom, hal):
+    """Repeat mode: one dict per frame (a frame is its data + 4 KiB tail), each with its own trigger index.
+
+    The bytes a frame carries beyond the record are device buffer content, not signal (see packet.split_frames);
+    decode() keeps only what the frame's tail marks valid.
+    """
+    from . import packet
+    layout = _layout(geom)
+    out = []
+    for frame in getattr(raw, 'frames', []) or []:
+        dec = packet.decode(bytes(frame), layout, fill_stale=True)
+        tail = dec.get('tail')
+        trig = packet.trigger_index(tail, layout) if (tail is not None and layout.pretrig is not None) else None
+        item = _decode_bytes(bytes(frame), geom, hal, layout, trig)
+        item['trig_index'] = trig
+        out.append(item)
+    return out
+
+
+def _layout(geom):
+    from . import packet
+    rates = {'analog': geom['analog_rate'], 'digital': geom['digital_rate']}
+    return packet.layout_from_regs(geom['_regs'], rates=rates, trig_domain=geom['trig_domain'])
+
+
+def _decode_bytes(data, geom, hal, layout, trig):
+    from . import packet
     dec = packet.decode(data, layout, fill_stale=True)
     an_names = ['A%d' % i for i, a in enumerate(hal['analog']) if a['enable']]
     dg_names = ['D%d' % i for i, d in enumerate(hal['digital']) if d]
     out = {'analog': {}, 'digital': {}, 't0_analog': 0.0, 't0_digital': 0.0}
     dom = geom['trig_domain']
-    trig = packet.trigger_index(head, layout) if head.get('triggered') else None
     for kind, names, depth in (('analog', an_names, geom['analog_depth']), ('digital', dg_names, geom['digital_depth'])):
         if not names:
             continue

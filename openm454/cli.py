@@ -217,6 +217,9 @@ def build_parser():
     sub.add_parser('info', help='device, firmware, calibration, limits')
     c = sub.add_parser('capture', help='single triggered capture -> JSON measurements + PNG + NPZ')
     _capture_args(c)
+    c.add_argument('--repeat', type=int, default=0, metavar='N',
+                   help='hardware repeat mode: collect N back-to-back frames in one start (default 0 = one capture); '
+                        'forces --trig-mode force, each frame has its own trigger point')
     w = sub.add_parser('watch', help='repeated captures, one JSON line each (real-time monitoring)')
     _capture_args(w, 'watch')
     g = w.add_argument_group('watch')

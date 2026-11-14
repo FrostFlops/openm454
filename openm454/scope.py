@@ -62,6 +62,7 @@ class Settings:
     holdoff: float = 0.0
     sensitivity: int = 5
     trig_retries: int = 4             # digital rise/fall trigger: re-arms after a misfire on the other edge
+    repeat: int = 0                   # hardware repeat mode: frames collected per start (0 = off, one capture)
 
 
 def settings_from_args(a):
@@ -179,6 +180,7 @@ def _timing_from_args(st, a):
     st.timeout = si(a.timeout, 's', '--timeout')
     st.holdoff = si(a.holdoff, 's', '--holdoff')
     st.sensitivity = a.sensitivity
+    st.repeat = int(getattr(a, 'repeat', 0) or 0)
     r = getattr(a, 'trig_retries', None)
     if r is not None:
         st.trig_retries = int(si(r, None, '--trig-retries'))
@@ -201,6 +203,21 @@ def afold_for(n):
 
 def dfold_for(n):
     return 0 if n == 0 else _fold(n, [(2, 4), (4, 2), (8, 1)])
+
+
+HINT_REPEAT = ('repeat mode re-arms in hardware: each frame starts on its own, so the trigger must be off '
+               '(--trig-mode force) — one trigger per frame is not what this mode does')
+
+
+def repeat_plan(st):
+    """Frames to collect per start (0 = a normal single capture), refusing a combination this mode cannot honour."""
+    n = int(getattr(st, 'repeat', 0) or 0)
+    if n < 0:
+        raise DscopeError('INVALID_ARG', 'repeat frame count must be >= 0 (%d)' % n, 'omit --repeat or pass a count >= 1')
+    if n and st.trig_source and st.trig_mode != 'force':
+        raise DscopeError('INVALID_ARG', 'repeat mode with a triggered start (%s, %s)' % (st.trig_source, st.trig_mode),
+                          HINT_REPEAT)
+    return n
 
 
 def hal_config(st):
@@ -297,7 +314,7 @@ def hal_config(st):
     hal = {'analog': ana, 'digital': [int('D%d' % i in st.digital) for i in range(8)],
            'threshold_uv': int(round(min(max(st.threshold, 0.0), 5.0) * 1e6)),
            'sample_time_ps': time_ps, 'storage_depth': storage, 'auto_rate': 1,
-           'trigger': trig, 'repeat': 0, 'roll': 0}
+           'trigger': trig, 'repeat': 1 if getattr(st, 'repeat', 0) else 0, 'roll': 0}
     return hal, scale, warnings, hints
 
 
@@ -503,16 +520,23 @@ class Scope:
 
     def capture(self, st):
         self._check_link()
+        repeat = repeat_plan(st)
         hal, scale, warnings, hints = hal_config(st)
         t_begin = time.time()
         attempts = []
         mode = st.trig_mode
         triggered_wanted = bool(st.trig_source) and mode != 'force'
         wait = (st.auto_after if mode == 'auto' else st.timeout) + max(st.holdoff, 0.0)   # holdoff delays the first trigger
+        if repeat:          # the device re-arms every frame, so there is no trigger to wait for
+            triggered_wanted = False
+            wait = 2.0
         hal['trigger']['enable'] = int(triggered_wanted)
         prog, geom = self._compile_ok(hal, warnings)
         collect = max(10.0, 1.5 * geom['record_s'] + 2.0)
-        raw = self._run(prog, geom, self._head_wait(geom, wait if triggered_wanted else 2.0), collect)
+        if repeat:          # back-to-back frames: 200 MB/s is a conservative floor for how long they take
+            collect = max(collect, 1.5 * repeat * geom['pkt_bytes'] / 2e8 + 2.0)
+        raw = self._run(prog, geom, self._head_wait(geom, wait if triggered_wanted else 2.0), collect,
+                        **({'repeat_frames': repeat} if repeat else {}))
         attempts.append(('triggered' if triggered_wanted else 'forced') if raw.head else 'no-trigger')
         if raw.head is None:
             self._overdriven = True             # no data to check: an input may have been saturated while waiting
@@ -534,7 +558,15 @@ class Scope:
             raise DscopeError('TIMEOUT_DATA', 'incomplete record: %d of %d data bytes (%s)' % (
                 len(raw.data), geom['need_bytes'], 'aborted' if raw.aborted else 'data stopped arriving'),
                 'retry once; if it repeats, check the USB 3 connection')
-        frame = _decode(raw, geom, hal)
+        frames = None
+        if repeat:                                          # one frame per transfer, each decoded on its own
+            frames = _decode_frames(raw, geom, hal)
+            if len(frames) < repeat:
+                raise DscopeError('TIMEOUT_DATA', 'repeat mode collected %d of %d frames' % (len(frames), repeat),
+                                  'retry once; if it repeats, check the USB 3 connection')
+            frame = frames[0]
+        else:
+            frame = _decode(raw, geom, hal)
         self._overdriven = _saturated(frame)
         check, misfires = 'unchecked', 0
         if attempts[-1] == 'triggered' and trigcheck.checked_edge(st.trig_edge) and st.trig_source.startswith('D'):
@@ -544,6 +576,10 @@ class Scope:
         meta['acq']['trigger_check'] = check
         meta['acq']['trigger_misfires'] = misfires
         cap = Capture(meta, frame['analog'], frame['digital'])
+        if frames is not None:
+            cap.frames = frames
+            cap.meta['acq']['repeat_frames'] = repeat
+            cap.meta['acq']['frames'] = len(frames)
         cap.meta['hints'] = _hints(cap) + hints
         return cap
 
@@ -893,3 +929,9 @@ def _decode(raw, geom, hal):
     """-> {'analog': {ch: uint8}, 'digital': {ch: uint8}, 't0_analog': s, 't0_digital': s}. Bound to openm454.packet."""
     from . import mso_adapter
     return mso_adapter.decode(raw, geom, hal)
+
+
+def _decode_frames(raw, geom, hal):
+    """Repeat mode: the same dict per frame, each cropped to its own record and trigger."""
+    from . import mso_adapter
+    return mso_adapter.decode_frames(raw, geom, hal)
