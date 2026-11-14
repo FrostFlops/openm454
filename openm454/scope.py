@@ -36,6 +36,10 @@ OVERDRIVE_SETTLE = 0.3           # measured: 1500 div of overdrive at 1 mV/div n
 MAX_SAMPLES = 400_000_000     # per channel; the 4 Gbit sample memory is the real bound (checked by mso)
 EP_MAX_PACKET = 1024          # EP 0x86 wMaxPacketSize; the USB 2 (high-speed) profile's 512 divides it
 
+from . import timing as _timing  # noqa: E402  (experimental branch: OPENM454_TIMING)
+_timing.apply(globals())
+
+
 
 @dataclass
 class Settings:

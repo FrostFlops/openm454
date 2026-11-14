@@ -56,6 +56,10 @@ POLL_EVERY = 0.015
 DRAIN_TIMEOUT = 2.0            # cancelled transfers must be back within this time
 MAX_EVENTS_PER_PASS = 32       # events handled between two checks of abort / stop_flag / deadlines
 
+from . import timing as _timing  # noqa: E402  (experimental branch: OPENM454_TIMING)
+_timing.apply(globals())
+
+
 _STATUS = {usb1.TRANSFER_COMPLETED: 'COMPLETED', usb1.TRANSFER_ERROR: 'ERROR', usb1.TRANSFER_TIMED_OUT: 'TIMED_OUT',
            usb1.TRANSFER_CANCELLED: 'CANCELLED', usb1.TRANSFER_STALL: 'STALL', usb1.TRANSFER_NO_DEVICE: 'NO_DEVICE',
            usb1.TRANSFER_OVERFLOW: 'OVERFLOW'}

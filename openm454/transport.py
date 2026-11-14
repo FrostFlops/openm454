@@ -36,6 +36,10 @@ EP_OUT, EP_CTRL_IN, EP_DATA_IN = 0x02, 0x84, 0x86
 READ_DELAY = 0.015             # RegRead asks for 10 ms, which lasts 13-31 ms on the Windows timer tick (trace)
 TIMEOUT_MS = 1000
 HS_TIMEOUT_MS = 1000             # UsbBsp3x_RegBulkIn timeout
+
+from . import timing as _timing  # noqa: E402  (experimental branch: OPENM454_TIMING)
+_timing.apply(globals())
+
 HINT_REOPEN = ('run the command once more: the next open first stops a run left behind (best effort). '
                'If that fails too (USB_ERROR or DEVICE_ERROR), unplug and replug the scope')
 USBFS_MEMORY = '/sys/module/usbcore/parameters/usbfs_memory_mb'    # Linux usbfs buffer limit, MiB (default 16)
