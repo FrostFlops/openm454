@@ -38,7 +38,23 @@ TIMEOUT_MS = 1000
 HS_TIMEOUT_MS = 1000             # UsbBsp3x_RegBulkIn timeout
 HINT_REOPEN = ('run the command once more: the next open first stops a run left behind (best effort). '
                'If that fails too (USB_ERROR or DEVICE_ERROR), unplug and replug the scope')
+USBFS_MEMORY = '/sys/module/usbcore/parameters/usbfs_memory_mb'    # Linux usbfs buffer limit, MiB (default 16)
+HINT_USBFS = ('Linux charges every queued USB read against the kernel usbfs buffer (usbfs_memory_mb, 16 MiB by '
+              'default, shared by every USB device). Raise it for this boot with sudo sh -c "echo 1000 > '
+              '/sys/module/usbcore/parameters/usbfs_memory_mb", or permanently with usbcore.usbfs_memory_mb=1000 '
+              'on the kernel command line')
 _ABANDONED = []                  # libusb objects that must never be closed or finalized (see Transport.close)
+
+
+def usbfs_memory_mb(path=USBFS_MEMORY):
+    """The usbfs buffer limit in MiB (0 = no limit), or None where there is no usbfs (Windows, macOS, no sysfs). Every
+    submitted URB is charged against it, buffer length plus a few hundred bytes of overhead, in drivers/usb/core/devio.c
+    (usbfs_increase_memory_usage), so reads that do not all fit fail in libusb with NO_MEM (-11) at submit time."""
+    try:
+        with open(path, encoding='ascii') as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 class Transport:

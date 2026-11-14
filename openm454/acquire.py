@@ -18,6 +18,11 @@ callbacks; RVAs refer to DSWave.exe 1.2.1):
      DEVICE_ERROR.  As in DSWave's transfer thread, a completed record or an abort is handled before an error that
      arrived with it: such an error gets the normal stop handshake and drain, but not the final writes.
 
+Linux charges every submitted EP 0x86 read against the kernel usbfs buffer (usbfs_memory_mb, 16 MiB by default, 0
+= no limit) in full, so a capture whose reads do not all fit is refused before the setup program (USB_NO_MEM, the
+message carries the bytes and the limit) or fails at submit with libusb NO_MEM when other processes hold part of the
+buffer. DSWave runs on Windows, where the USB stack has no such limit.
+
 Ctrl+C (SIGINT) during a run only requests the normal stop; KeyboardInterrupt is raised after the device has
 been stopped. Exceptions inside the libusb callback become an error stop instead of being lost. Exceptions from the
 caller's on_chunk / stop_flag are not device failures: the run is stopped normally and the exception re-raised.
@@ -35,7 +40,7 @@ import usb1
 
 from . import regs
 from .errors import DscopeError
-from .transport import HINT_REOPEN
+from .transport import HINT_REOPEN, HINT_USBFS, usbfs_memory_mb
 
 HEAD_BYTES = 4096
 HEAD_MAGIC = b'\x55\x55\x55\x55'
@@ -53,6 +58,18 @@ MAX_EVENTS_PER_PASS = 32       # events handled between two checks of abort / st
 _STATUS = {usb1.TRANSFER_COMPLETED: 'COMPLETED', usb1.TRANSFER_ERROR: 'ERROR', usb1.TRANSFER_TIMED_OUT: 'TIMED_OUT',
            usb1.TRANSFER_CANCELLED: 'CANCELLED', usb1.TRANSFER_STALL: 'STALL', usb1.TRANSFER_NO_DEVICE: 'NO_DEVICE',
            usb1.TRANSFER_OVERFLOW: 'OVERFLOW'}
+
+
+def _queued_bytes(pkt_bytes, n_transfers):
+    """What a run submits at once: the head read plus every data read (the kernel charges each of them in full)."""
+    return HEAD_BYTES + n_transfers * pkt_bytes
+
+
+def _usbfs_error(what, pkt_bytes, n_transfers, limit):
+    """USB_NO_MEM naming the numbers the kernel checks: the bytes this run queues and the usbfs limit in MiB."""
+    return DscopeError('USB_NO_MEM', '%s: %d B of EP 0x86 reads queued at once (%d x %d B + a %d B head), the Linux '
+                       'usbfs buffer is %d MiB' % (what, _queued_bytes(pkt_bytes, n_transfers), n_transfers,
+                                                   pkt_bytes, HEAD_BYTES, limit), HINT_USBFS)
 
 
 class RawCapture:
@@ -236,6 +253,10 @@ class Engine:
     def _run(self, setup_writes, pkt_bytes, need_bytes, n_transfers, trigger_timeout, collect_timeout,
              repeat_frames, on_chunk, stop_flag, poll, settle=0.0, keep_data=True):
         t = self.t
+        limit = usbfs_memory_mb()          # Linux only (0 = no limit): checked before the setup program
+        # a lower bound: the kernel also charges a few hundred bytes per URB, and other processes share the limit
+        if limit and _queued_bytes(pkt_bytes, n_transfers) > limit * 1024 * 1024:
+            raise _usbfs_error('refusing this capture before the setup program', pkt_bytes, n_transfers, limit)
         cap = RawCapture()
         self._events = collections.deque()
         self._stopping = False
@@ -262,6 +283,9 @@ class Engine:
         except usb1.USBError as e:
             self._stopping = True           # nothing was started: just take the reads back
             self._cancel_and_wait()
+            limit = usbfs_memory_mb() if getattr(e, 'value', None) == usb1.ERROR_NO_MEM else None
+            if limit:                       # NO_MEM on a host with a usbfs limit: the buffer, not a device problem
+                raise _usbfs_error('libusb NO_MEM while queueing', pkt_bytes, n_transfers, limit)
             raise DscopeError('USB_ERROR', 'cannot queue EP 0x86 reads: %s' % e, HINT_REOPEN)
         time.sleep(SUBMIT_TO_START)
 

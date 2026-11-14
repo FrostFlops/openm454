@@ -11,16 +11,17 @@ import time
 import pytest
 import usb1
 
+from openm454 import acquire as acq
 from openm454 import regs
 from openm454.acquire import Engine, HEAD_BYTES
 from openm454.errors import DscopeError
-from openm454.transport import Transport, REQ_WRITE, REQ_READ_SETUP, REQ_READ
+from openm454.transport import Transport, REQ_WRITE, REQ_READ_SETUP, REQ_READ, usbfs_memory_mb
 
 PKT = 8192
 
 
 class Sim:
-    def __init__(self, head_after=0.0, trigger=True, ep84='ok', zlp_at=None, fail_hs_at=None):
+    def __init__(self, head_after=0.0, trigger=True, ep84='ok', zlp_at=None, fail_hs_at=None, submit_error=None):
         self.regs = {}
         self.log = []              # ('W'|'R'|'EP84'|'cancel', ...)
         self.violations = []
@@ -34,6 +35,7 @@ class Sim:
         self.ep84_mode = ep84
         self.fail_hs_at = fail_hs_at
         self.zlp_at = zlp_at
+        self.submit_error = submit_error   # raised by submit(): a host-side failure, nothing reaches the device
         self.t_run = None
         self.head_sent = False
         self.data_sent = 0
@@ -123,6 +125,8 @@ class FakeTransfer:
 
     def submit(self):
         assert not self._submitted
+        if self.sim.submit_error is not None:    # as libusb: the transfer is refused, never becomes pending
+            raise self.sim.submit_error
         self._submitted, self._cancel = True, False
         self.sim.pending.append(self)
 
@@ -708,3 +712,53 @@ def test_endless_run_without_buffering_stops_on_the_flag():
     assert cap.stop == 'normal' and cap.stopped and not cap.timed_out
     assert len(cap.data) == 0 and cap.n_data == sum(len(b) for b in got[1:]) >= 50 * PKT
     assert sim.violations == [] and not sim.starved and cap.ep84 == [1, 2, 3]
+
+
+def test_usbfs_limit_is_read_from_sysfs(tmp_path):
+    p = tmp_path / 'usbfs_memory_mb'
+    p.write_text('1000\n', encoding='ascii')
+    assert usbfs_memory_mb(str(p)) == 1000
+    p.write_text('0\n', encoding='ascii')                       # devio.c: "0 = no limit"
+    assert usbfs_memory_mb(str(p)) == 0
+    assert usbfs_memory_mb(str(tmp_path / 'missing')) is None    # Windows, macOS, no sysfs
+    p.write_text('nonsense\n', encoding='ascii')
+    assert usbfs_memory_mb(str(p)) is None
+
+
+def test_a_zero_limit_means_unlimited(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 0)
+    sim, eng = engine()
+    cap = eng.run(SETUP, pkt_bytes=128 * 1024, need_bytes=128 * 1024, n_transfers=16, trigger_timeout=1.0)
+    assert cap.stop == 'normal' and sim.violations == []
+
+
+def test_a_capture_larger_than_the_usbfs_buffer_is_refused_before_the_setup_program(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 1)       # 1 MiB, smaller than a stock Linux's 16
+    sim, eng = engine()
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=128 * 1024, need_bytes=128 * 1024, n_transfers=16, trigger_timeout=1.0)
+    assert ei.value.code == 'USB_NO_MEM' and ei.value.exit_code == 6
+    assert '2101248 B' in ei.value.message and '1 MiB' in ei.value.message    # 16 x 128 KiB + the 4 KiB head
+    assert 'usbfs_memory_mb' in ei.value.hint
+    assert sim.log == [] and sim.pending == []                   # refused before any write: the device is untouched
+    assert not eng.t.running and not eng.t.failed
+
+
+def test_submit_no_mem_names_the_usbfs_limit(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine(submit_error=usb1.USBError(usb1.ERROR_NO_MEM))
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=2, trigger_timeout=1.0)
+    assert ei.value.code == 'USB_NO_MEM' and 'usbfs buffer is 16 MiB' in ei.value.message
+    assert 'usbfs_memory_mb' in ei.value.hint
+    assert sim.pending == [] and not eng.t.running               # nothing queued, nothing started
+
+
+def test_no_mem_without_usbfs_stays_a_plain_usb_error(monkeypatch):
+    """Windows, macOS: no usbfs buffer, so NO_MEM is plain host memory and the reopen hint still applies."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: None)
+    sim, eng = engine(submit_error=usb1.USBError(usb1.ERROR_NO_MEM))
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=2, trigger_timeout=1.0)
+    assert ei.value.code == 'USB_ERROR' and 'NO_MEM' in ei.value.message
+    assert 'replug' in ei.value.hint and sim.pending == []
