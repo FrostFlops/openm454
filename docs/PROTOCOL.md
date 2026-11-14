@@ -162,6 +162,17 @@ Implementation (with the RVAs): `openm454/acquire.py`.
 2. Queue bulk reads on EP 0x86 **before** starting: one 4096-byte head, then N data transfers of `pkt_bytes`
    (N = 16 on USB3, 2 in repeat mode, up to 64 in roll mode; `pkt_bytes` = 1,048,320 for most single
    captures). There is no timeout on these reads. Wait 50 ms.
+   The driver pads every data read to a multiple of 1024 bytes on every OS except repeat mode (1,048,576 instead of
+   DSWave's 1,048,320). Windows and macOS keep DSWave's N. On Linux the queue also has to fit the usbfs buffer:
+   N = min(geometry N, (limit*MiB - 4608 - 2048) // (pkt + 512 + 40*ceil(pkt/16384))), which is 15 at the stock
+   16 MiB for 1 MiB reads (each read is charged its length + ~300 B of URB bookkeeping, plus one 32 B scatterlist
+   entry per 16 KiB; 4608 = head + its charge, 2048 = reserve for the one control or EP 0x84 transfer in flight).
+   The lowered N is accepted only when it reaches the floor: at least 4 reads, or at least 2 reads that hold 4 MiB
+   (4 reads of ~1 MiB, 3 of ~2 MB, 2-3 of a live stream's 4-10 MB). Below it the run is refused with `USB_NO_MEM`
+   before the setup program. A libusb NO_MEM at submit keeps the reads already queued when they reach the floor
+   (`acq.transfers` is then lower than `acq.transfers_wanted`); otherwise all are cancelled and the error is
+   `USB_NO_MEM`. A NO_MEM on a resubmit during a run is `DEVICE_ERROR`: the scope is left running and the next
+   open stops it.
 3. Start: W 0x03 = sync (0), W 0x02 = 0, W 0x01 = 1, 1 ms.
 4. **While running** (from W 0x01 = 1 until the stop handshake has completed), every control transfer must be
    inside an **EP 0x84 handshake**. Read 1 byte from EP 0x84 and expect 01. Read another and expect 02. Then send

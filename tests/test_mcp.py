@@ -287,6 +287,21 @@ def test_summary_trims_long_decoder_output():
     assert doc['warnings'] == ['w'] and doc['analog'] == {'A1': {'vmin_v': 0.0}} and not doc['ok']
 
 
+def test_summary_shows_the_queue_depth_only_when_it_was_lowered():
+    """acq.transfers stays in the full CLI document; the compact summary names it only when the engine queued fewer
+    reads than the geometry wanted (a small Linux usbfs budget). A missing transfers_wanted means not lowered."""
+    base = {'ok': True, 'cmd': 'capture', 'acq': {'samples': 1000, 'complete': True}}
+    for acq in ({'transfers': 16}, {'transfers': 16, 'transfers_wanted': 16}, {'transfers': None},
+                {'transfers': 10, 'transfers_wanted': 4}):
+        out = M.summarize(dict(base, acq=dict(base['acq'], **acq)))
+        assert 'transfers' not in out['acq'] and 'transfers_wanted' not in out['acq'], acq
+        assert out['acq']['samples'] == 1000
+    out = M.summarize(dict(base, acq=dict(base['acq'], transfers=15, transfers_wanted=16)))
+    assert out['acq']['transfers'] == 15 and out['acq']['transfers_wanted'] == 16
+    log = M.summarize({'ok': True, 'cmd': 'log', 'acq': {'mode': 'loop', 'transfers': 8, 'transfers_wanted': 10}})
+    assert (log['acq']['transfers'], log['acq']['transfers_wanted']) == (8, 10)
+
+
 def test_log_plan_and_awg_arguments(fake):
     call(fake, 'log_plan', {'rate': '1M', 'duration': '10min', 'channels': 'A1,D0', 'vdiv': 'A1=2V'})
     assert fake.argv()[-1] == ['log', '-c', 'A1,D0', '--vdiv', 'A1=2V', '--rate', '1M', '--duration', '10min',

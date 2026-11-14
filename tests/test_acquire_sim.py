@@ -21,7 +21,8 @@ PKT = 8192
 
 
 class Sim:
-    def __init__(self, head_after=0.0, trigger=True, ep84='ok', zlp_at=None, fail_hs_at=None, submit_error=None):
+    def __init__(self, head_after=0.0, trigger=True, ep84='ok', zlp_at=None, fail_hs_at=None, submit_error=None,
+                 no_mem_at=()):
         self.regs = {}
         self.log = []              # ('W'|'R'|'EP84'|'cancel', ...)
         self.violations = []
@@ -36,6 +37,8 @@ class Sim:
         self.fail_hs_at = fail_hs_at
         self.zlp_at = zlp_at
         self.submit_error = submit_error   # raised by submit(): a host-side failure, nothing reaches the device
+        self.no_mem_at = set(no_mem_at)    # submit() calls (1 = the head) that libusb refuses with NO_MEM
+        self.submits = 0
         self.t_run = None
         self.head_sent = False
         self.data_sent = 0
@@ -125,8 +128,11 @@ class FakeTransfer:
 
     def submit(self):
         assert not self._submitted
+        self.sim.submits += 1
         if self.sim.submit_error is not None:    # as libusb: the transfer is refused, never becomes pending
             raise self.sim.submit_error
+        if self.sim.submits in self.sim.no_mem_at:
+            raise usb1.USBError(usb1.ERROR_NO_MEM)
         self._submitted, self._cancel = True, False
         self.sim.pending.append(self)
 
@@ -738,8 +744,12 @@ def test_a_capture_larger_than_the_usbfs_buffer_is_refused_before_the_setup_prog
     with pytest.raises(DscopeError) as ei:
         eng.run(SETUP, pkt_bytes=256 * 1024, need_bytes=256 * 1024, n_transfers=16, trigger_timeout=1.0)
     assert ei.value.code == 'USB_NO_MEM' and ei.value.exit_code == 6
-    assert '4198400 B' in ei.value.message and '1 MiB' in ei.value.message    # 16 x 256 KiB + the 4 KiB head
-    assert 'usbfs_memory_mb' in ei.value.hint
+    m = ei.value.message
+    assert 'usbfs buffer is 1 MiB' in m
+    # the minimum (4 reads) and the full queue, each with the kernel's per-read charge and the limit that holds it
+    assert 'at least 4 x 262144 B + a 4096 B head = 1059840 B charged, usbfs_memory_mb >= 2' in m
+    assert 'full queue: 16 x 262144 B + a 4096 B head = 4219392 B charged, usbfs_memory_mb >= 5' in m
+    assert 'usbfs_memory_mb' in ei.value.hint and '--record-first' not in ei.value.hint
     assert sim.log == [] and sim.pending == []                   # refused before any write: the device is untouched
     assert not eng.t.running and not eng.t.failed
 
@@ -784,8 +794,8 @@ def test_submit_no_mem_names_the_usbfs_limit(monkeypatch):
     sim, eng = engine(submit_error=usb1.USBError(usb1.ERROR_NO_MEM))
     with pytest.raises(DscopeError) as ei:
         eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=2, trigger_timeout=1.0)
-    assert ei.value.code == 'USB_NO_MEM' and 'usbfs buffer is 16 MiB' in ei.value.message
-    assert 'usbfs_memory_mb' in ei.value.hint
+    assert ei.value.code == 'USB_NO_MEM' and '16 MiB Linux usbfs buffer' in ei.value.message
+    assert 'after 0 of 2' in ei.value.message and 'usbfs_memory_mb' in ei.value.hint
     assert sim.pending == [] and not eng.t.running               # nothing queued, nothing started
 
 
@@ -797,3 +807,175 @@ def test_no_mem_without_usbfs_stays_a_plain_usb_error(monkeypatch):
         eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=2, trigger_timeout=1.0)
     assert ei.value.code == 'USB_ERROR' and 'NO_MEM' in ei.value.message
     assert 'replug' in ei.value.hint and sim.pending == []
+
+
+# ---------------------------------------------------------------------------------------------- usbfs review
+MiB = 1024 * 1024
+
+
+def test_the_floor_is_queued_data_in_at_least_two_reads():
+    assert acq._min_transfers(PKT) == 4 and acq._min_transfers(MiB) == 4        # captures: 4 reads as before
+    assert acq._min_transfers(1398101) == 4 and acq._min_transfers(1398102) == 3  # 3 reads hold 4 MiB from here
+    assert acq._min_transfers(2 * MiB - 1) == 3 and acq._min_transfers(2 * MiB) == 2
+    assert acq._min_transfers(8000512) == 2                                     # live stream: 2 reads = 40 ms
+
+
+def test_transfers_for_boundaries():
+    assert acq._transfers_for(None, MiB, 16) == 16 and acq._transfers_for(0, MiB, 16) == 16   # no usbfs / no limit
+    assert acq._transfers_for(16, MiB, 16) == 15                 # a fast capture at the stock 16 MiB
+    assert acq._transfers_for(16, 1048320, 16) == 15             # unpadded too: the per-read charge leaves no room
+    assert acq._transfers_for(5, MiB, 16) == 4                   # exactly the floor
+    assert acq._transfers_for(4, MiB, 16) is None                # 3 x 1 MiB: below the floor
+    assert acq._transfers_for(3, MiB, 2) == 2                    # the budget holds what was asked for
+    assert acq._transfers_for(2, MiB, 2) is None                 # asked for 2, 1 fits
+    assert acq._transfers_for(16, 8000512, 10) == 2              # stream -c A0 --rate 400M at the stock limit
+    assert acq._transfers_for(16, 4500480, 10) == 3              # stream -c A0,D0 --rate 200M
+    assert acq._transfers_for(16, 9000960, 10) is None           # 1 read of 9 MB: refused
+
+
+def test_the_budget_charges_what_devio_charges():
+    """devio.c: buffer + URB bookkeeping + a scatterlist entry per 16 KiB, and a control transfer is in flight too.
+    At 43 MiB ten 4500480-byte reads fit by length alone (45008896 B) but not as charged: 9 are queued."""
+    assert acq.HEAD_BYTES + 10 * 4500480 <= 43 * MiB < acq._queued_bytes(4500480, 10)
+    assert acq._queued_bytes(4500480, 9) <= 43 * MiB
+    assert acq._transfers_for(43, 4500480, 10) == 9
+    assert acq._charge(acq.HEAD_BYTES) == acq.HEAD_BYTES + acq.URB_OVERHEAD          # one sg entry: not charged
+
+
+def test_a_live_stream_runs_with_two_large_reads_at_the_stock_limit(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine()
+    got = []
+    cap = eng.run(SETUP, pkt_bytes=8000512, need_bytes=None, n_transfers=10, trigger_timeout=1.0,
+                  collect_timeout=None, on_chunk=got.append, stop_flag=lambda: len(got) > 4, poll=False,
+                  keep_data=False)
+    assert (cap.transfers, cap.transfers_wanted) == (2, 10) and len(eng._trs) == 3
+    assert cap.stop == 'normal' and sim.violations == [] and sim.pending == []
+
+
+def test_a_refused_live_stream_names_the_minimum_and_record_first(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine()
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=9000960, need_bytes=None, n_transfers=10, trigger_timeout=1.0)
+    assert ei.value.code == 'USB_NO_MEM'
+    assert 'at least 2 x 9000960 B' in ei.value.message and 'usbfs_memory_mb >= 18' in ei.value.message
+    assert 'full queue: 10 x 9000960 B' in ei.value.message and '--record-first' in ei.value.hint
+    assert sim.log == []
+
+
+def test_the_wanted_depth_is_recorded(monkeypatch):
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: None)    # Windows: the geometry's depth, unchanged
+    sim, eng = engine()
+    cap = eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=16, trigger_timeout=1.0)
+    assert cap.transfers == cap.transfers_wanted == 16
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 8)
+    sim, eng = engine()
+    cap = eng.run(SETUP, pkt_bytes=MiB, need_bytes=MiB, n_transfers=16, trigger_timeout=1.0)
+    assert (cap.transfers, cap.transfers_wanted) == (7, 16)
+
+
+def test_no_mem_partway_through_queueing_takes_every_read_back(monkeypatch):
+    """Another usbfs user holds part of the buffer: the head and 3 reads are accepted, the 4th is refused. Fewer than
+    the floor: the 4 queued reads are cancelled and drained, and the device only saw the setup program."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine(no_mem_at={5})
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=8, trigger_timeout=1.0)
+    assert ei.value.code == 'USB_NO_MEM' and 'after 3 of 8' in ei.value.message
+    assert '16 MiB Linux usbfs buffer' in ei.value.message and 'usbfs_memory_mb' in ei.value.hint
+    assert sim.pending == [] and sum(1 for e in sim.log if e[0] == 'cancel') == 4
+    assert writes(sim) == SETUP and (regs.CTRL, 1) not in writes(sim)       # never started
+    assert not eng.t.running and not eng.t.stale and not eng.t.failed
+
+
+def test_no_mem_partway_through_queueing_keeps_a_queue_at_the_floor(monkeypatch):
+    """The head and 4 reads are accepted, the 5th is refused: nothing is started yet, so the run uses those 4."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine(no_mem_at={6})
+    cap = eng.run(SETUP, pkt_bytes=PKT, need_bytes=20 * PKT, n_transfers=8, trigger_timeout=1.0)
+    assert (cap.transfers, cap.transfers_wanted) == (4, 8) and len(eng._trs) == 5
+    assert cap.stop == 'normal' and len(cap.data) >= 20 * PKT
+    assert sim.violations == [] and sim.pending == [] and not eng.t.failed
+
+
+def test_no_mem_from_get_transfer_keeps_every_queued_read_tracked(monkeypatch):
+    """python-libusb1 raises NO_MEM from getTransfer() itself (libusb_alloc_transfer returned NULL), before _submit
+    appends anything: the head and 5 reads are queued and all 5 are used, none is dropped while still submitted."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine()
+    real, calls = eng.t.h.getTransfer, [0]
+
+    def get_transfer():
+        calls[0] += 1
+        if calls[0] == 7:
+            raise usb1.USBErrorNoMem()
+        return real()
+    eng.t.h.getTransfer = get_transfer
+    cap = eng.run(SETUP, pkt_bytes=PKT, need_bytes=20 * PKT, n_transfers=8, trigger_timeout=1.0)
+    assert (cap.transfers, cap.transfers_wanted) == (5, 8) and len(eng._trs) == 6
+    assert cap.stop == 'normal' and len(cap.data) >= 20 * PKT
+    assert sim.violations == [] and sim.pending == [] and not eng.t.failed and not eng.t.stale
+
+
+def test_no_mem_partway_without_usbfs_stays_a_usb_error(monkeypatch):
+    """Windows, macOS: no fallback, every queued read is taken back and the error is USB_ERROR as before."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: None)
+    sim, eng = engine(no_mem_at={6})
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=PKT, need_bytes=PKT, n_transfers=8, trigger_timeout=1.0)
+    assert ei.value.code == 'USB_ERROR' and 'replug' in ei.value.hint
+    assert sim.pending == [] and sum(1 for e in sim.log if e[0] == 'cancel') == 5 and writes(sim) == SETUP
+
+
+def test_resubmit_no_mem_is_an_error_stop_with_the_usbfs_hint(monkeypatch):
+    """A resubmit refused mid-run: the same error stop as any transfer error (nothing more is sent, DEVICE_ERROR),
+    but the hint names the usbfs buffer instead of telling the user to replug a scope that is fine."""
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine(no_mem_at={8})                    # head + 4 reads, 2 resubmits, the 3rd one is refused
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=PKT, need_bytes=1000 * PKT, n_transfers=4, trigger_timeout=1.0)
+    e = ei.value
+    assert e.code == 'DEVICE_ERROR' and e.exit_code == 6
+    assert 'resubmit failed' in e.message and 'NO_MEM' in e.message and '16 MiB' in e.message
+    assert 'usbfs_memory_mb' in e.hint and 'replug' not in e.hint
+    assert eng.t.failed and not eng.t.running and sim.violations == [] and sim.after_fail == []
+    assert writes(sim)[-1] == (regs.CTRL, 1)            # error stop: nothing written after the start
+    assert not any(tr.isSubmitted() for tr in eng._trs)
+
+
+def test_resubmit_no_mem_without_usbfs_keeps_the_reopen_hint(monkeypatch):
+    from openm454.transport import HINT_REOPEN
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: None)
+    sim, eng = engine(no_mem_at={8})
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=PKT, need_bytes=1000 * PKT, n_transfers=4, trigger_timeout=1.0)
+    assert ei.value.code == 'DEVICE_ERROR' and ei.value.hint == HINT_REOPEN
+    assert ei.value.message == 'data transfer resubmit failed: %s' % usb1.USBError(usb1.ERROR_NO_MEM)
+
+
+def test_another_error_stop_keeps_the_reopen_hint_under_usbfs(monkeypatch):
+    from openm454.transport import HINT_REOPEN
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    sim, eng = engine(zlp_at=3)
+    with pytest.raises(DscopeError) as ei:
+        eng.run(SETUP, pkt_bytes=PKT, need_bytes=100 * PKT, n_transfers=4, trigger_timeout=1.0)
+    assert 'zero-length' in ei.value.message and ei.value.hint == HINT_REOPEN
+
+
+def test_a_fast_capture_geometry_reaches_the_engine_as_15_reads_of_1_mib(monkeypatch):
+    """Scope pads the 1048320-byte reads to 1 MiB before the engine budgets them: 15 fit the stock 16 MiB."""
+    from openm454 import scope as scopemod
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: 16)
+    s = scopemod.Scope()
+    st = scopemod.Settings()
+    st.analog, st.digital = ['A0', 'A1', 'A2', 'A3'], ['D%d' % i for i in range(8)]
+    st.rate, st.duration, st.trig_mode, st.trig_source = 100e6, 5e-3, 'force', None
+    geom = s.plan(st)['geometry']
+    assert (geom['pkt_bytes'], geom['transfer_count']) == (1048320, 16)
+    sim = Sim()
+    s.engine = Engine(FakeDevice(sim))
+    raw = s._run(SETUP, geom, 1.0, 10.0)
+    assert (raw.transfers, raw.transfers_wanted) == (15, 16)
+    assert [tr._n for tr in s.engine._trs] == [HEAD_BYTES] + [MiB] * 15
+    assert raw.stop == 'normal' and sim.violations == []

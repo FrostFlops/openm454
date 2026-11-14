@@ -351,8 +351,8 @@ class Job:
 A_KEYS = ('freq_hz', 'vpp_v', 'vmin_v', 'vmax_v', 'vmean_v', 'duty_pct', 'rise_s', 'fall_s')
 D_KEYS = ('state', 'freq_hz', 'duty_pct', 'edges', 'high_frac')
 ACQ_KEYS = ('triggered', 'trigger_check', 'trigger_misfires', 'mode', 'analog_rate_hz', 'digital_rate_hz', 'rate_hz',
-            'samples', 'duration_s', 'complete', 'stop_reason', 'transfers', 'host_mb_s', 'backlog_max_mb',
-            'unread_at_stop_mb')
+            'samples', 'duration_s', 'complete', 'stop_reason', 'transfers', 'transfers_wanted', 'host_mb_s',
+            'backlog_max_mb', 'unread_at_stop_mb')
 ACQ_SKIP = {'trigger_check': ('unchecked',), 'trigger_misfires': (0,)}       # left out of summaries when uneventful
 LONG_TEXT = 400
 PLAN_KEYS = ('rate_hz', 'channels', 'data_mb_s', 'verdict', 'readout_mb_s', 'gapfree_max_s', 'recommendation',
@@ -425,6 +425,13 @@ def summarize_selftest(doc):
     return out
 
 
+def _queue_lowered(acq):
+    """True when the engine queued fewer EP 0x86 reads than the geometry wanted (a small Linux usbfs budget); a
+    missing transfers_wanted means not lowered."""
+    n, want = acq.get('transfers'), acq.get('transfers_wanted')
+    return isinstance(n, int) and isinstance(want, int) and n < want
+
+
 def summarize(doc):
     """The CLI document reduced to what an agent reads: settings, trigger, key measurements, files, warnings (and
     the error, for a failed command: data up to a stop is kept and summarized too)."""
@@ -436,8 +443,11 @@ def summarize(doc):
         if applied.get('trigger'):
             out['trigger'] = {k: v for k, v in applied['trigger'].items() if v is not None}
     if doc.get('acq'):
-        out['acq'] = {k: doc['acq'][k] for k in ACQ_KEYS
-                      if doc['acq'].get(k) is not None and doc['acq'][k] not in ACQ_SKIP.get(k, ())}
+        acq = doc['acq']
+        out['acq'] = {k: acq[k] for k in ACQ_KEYS if acq.get(k) is not None and acq[k] not in ACQ_SKIP.get(k, ())}
+        if not _queue_lowered(acq):              # the geometry's depth (always on Windows): nothing to report
+            out['acq'].pop('transfers', None)
+            out['acq'].pop('transfers_wanted', None)
     for group, keys in (('analog', A_KEYS), ('digital', D_KEYS)):
         if doc.get(group):
             out[group] = {}

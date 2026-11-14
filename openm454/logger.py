@@ -81,6 +81,7 @@ RECORD_SAMPLES = 400_000_000         # a stream record: at most 400M samples per
 PROBE_S = 2.0                        # readout probe before a log above SUSTAINED_BPS whose channel set was not measured
 PROBE_BACKLOG = 256 * 2 ** 20        # ... ends early once the scope is this far ahead (its data are dropped anyway)
 KEPT_UP = 0.99                       # a probe reading >= this x D: the host keeps up (R >= D, a lower bound)
+SMALL_PKT_TRANSFERS = 4              # small packets: DSWave queues 1 read of one block, the driver at least this many
 
 
 def available_ram():
@@ -112,6 +113,13 @@ def default_ram_budget():
     if allowed:
         return int(min(allowed, 0.8 * free))
     return int(min(RAM_BUDGET_MAX, free // 4))
+
+
+def planned_transfers(geom):
+    """EP 0x86 reads a loop run asks the engine to queue at once (on Linux the engine may queue fewer when the usbfs
+    budget cannot hold them: the run's acq.transfers is the depth actually used)."""
+    n = geom['transfer_count']
+    return max(SMALL_PKT_TRANSFERS, n) if geom['small_pkt'] else n
 
 
 def loop_hal(st, rate, fold=False, divider=None):
@@ -327,7 +335,7 @@ def plan(st, rate, duration=None, every=1.0, out_dir=None, storage='ram', ram_bu
         'chunks': (math.ceil(run_s / chunk_s) if run_s else None) if storage == 'disk' else None,
         'disk_free_gb': None if disk_free is None else round(disk_free / 1e9, 1),
         'max_duration_s': None if max_s is None else math.floor(max_s * 100) / 100, 'every_s': round(every, 6),
-        'small_packets': small, 'packet_bytes': geom['pkt_bytes'], 'transfers': geom['transfer_count'],
+        'small_packets': small, 'packet_bytes': geom['pkt_bytes'], 'transfers_planned': planned_transfers(geom),
         'interleaved': fold, 'divider': divider, 'max_rate_hz': top,
         'readout_mb_s': round(R / 1e6, 1), 'readout_source': rsrc,
         'backlog_growth_mb_s': round(max(0.0, data_bps - R) / 1e6, 1), 'gapfree_max_s': gapfree,
@@ -401,8 +409,7 @@ def measure_readout(scope, pl, seconds=PROBE_S):
     from . import host
     geom = dict(pl['_geom'])
     small = bool(geom['small_pkt'])
-    if small:
-        geom['transfer_count'] = max(4, geom['transfer_count'])
+    geom['transfer_count'] = planned_transfers(geom)
     blk = packet.layout_from_regs(geom['_regs'], rates={'analog': pl['rate_hz'], 'digital': pl['rate_hz']}).block_bytes
     D = pl['_data_bps']
     log = []
@@ -772,13 +779,13 @@ def run(scope, st, pl, out_stem=None, emit=None, stop_flag=None, heartbeat=None,
     stop; the data up to the stop is kept). Device errors raise DscopeError after the files were closed.
     out_stem None: nothing is written (RAM data is dropped at the end). on_final(nbytes) is called before the
     final RAM file is written (the CLI extends its watchdog for the write)."""
+    from .scope import queue_depth
     geom = dict(pl['_geom'])
     rate = pl['rate_hz']
     layout = packet.layout_from_regs(geom['_regs'], rates={'analog': rate, 'digital': rate})
     small = bool(geom['small_pkt'])
     blk = layout.block_bytes
-    if small:
-        geom['transfer_count'] = max(4, geom['transfer_count'])   # DSWave queues 1 read of one block
+    geom['transfer_count'] = planned_transfers(geom)
     data_bps = pl['_data_bps']
     piece_bytes = max(blk, min(pl['_every_blocks'] * blk, PIECE_BYTES // blk * blk))
     if hook is not None:                             # the hook reacts within about PIECE_S of signal
@@ -943,7 +950,7 @@ def run(scope, st, pl, out_stem=None, emit=None, stop_flag=None, heartbeat=None,
            'backlog_max_mb': round(s['backlog_max'] / 1e6, 2), 'stop_reason': s['reason'],
            'unread_at_stop_mb': round(s['backlog'] / 1e6, 1),
            'head_word': '%08X' % int.from_bytes(raw.head[8:12], 'little'), 'stop': raw.stop,
-           'elapsed_s': round(time.time() - t0_wall, 3)}
+           **queue_depth(raw), 'elapsed_s': round(time.time() - t0_wall, 3)}
     res = {'ok': True, 'cmd': 'log', 'plan': public(pl), 'acq': acq}
     res.update(w.summary())
     if hook is not None:

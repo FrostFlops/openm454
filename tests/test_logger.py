@@ -45,7 +45,8 @@ def test_loop_program_matches_the_hardware_verified_one():
     assert regs[0x00] == 6                                        # HW_BASE_MODE: stream + loop
     assert (regs[0x13] | regs[0x14] << 16) + 1 == 1280            # HORI_RWORDS = one 5120-byte packet
     assert regs[0x28] == 0x400 and regs[0x20] == 0x800            # folds 0: 0x100 x channels
-    assert pl['packet_bytes'] == 5120 and pl['transfers'] == 10 and pl['_geom']['need_bytes'] is None
+    assert pl['packet_bytes'] == 5120 and pl['transfers_planned'] == 10 and pl['_geom']['need_bytes'] is None
+    assert 'transfers' not in pl                                  # the run's acq.transfers is the depth actually used
     lay = packet.layout_from_regs(pl['_geom']['_regs'], rates={'analog': 50e3, 'digital': 50e3})
     assert lay.loop and lay.acq_words is None and lay.block_bytes == 320
 
@@ -298,6 +299,35 @@ def test_small_packets_take_one_block_per_read(tmp_path):
     cap = load_capture(res['files']['npz'])
     np.testing.assert_array_equal(cap.analog['A2'], an[2][:len(cap.analog['A2'])])
     assert fs.calls[0][0]['transfer_count'] >= 4 and fs.calls[0][1] is None
+    # the plan reports the depth the run asks for, not DSWave's 1 read of one block
+    assert pl['small_packets'] and pl['_geom']['transfer_count'] < logger.SMALL_PKT_TRANSFERS
+    assert pl['transfers_planned'] == fs.calls[0][0]['transfer_count'] == logger.SMALL_PKT_TRANSFERS
+
+
+class DepthScope(FakeScope):
+    """FakeScope whose engine queued `got` reads (Linux: a usbfs budget may lower the planned depth)."""
+
+    def __init__(self, *a, got=None, **kw):
+        super().__init__(*a, **kw)
+        self.got = got
+
+    def _run(self, prog, geom, *a, **kw):
+        raw = super()._run(prog, geom, *a, **kw)
+        raw.transfers_wanted = geom['transfer_count']
+        raw.transfers = self.got if self.got is not None else geom['transfer_count']
+        return raw
+
+
+def test_log_result_reports_the_queue_depth_it_used(tmp_path):
+    pl = make_plan(['A2'], ['D0', 'D1'], 100e3, 0.5)
+    stream = fake_signal(pl, 1.0)[3]
+    res = logger.run(DepthScope(stream, pl['packet_bytes']), settings(['A2'], ['D0', 'D1']), pl)
+    assert res['acq']['transfers'] == pl['transfers_planned'] and 'transfers_wanted' not in res['acq']
+    want = pl['transfers_planned']
+    res = logger.run(DepthScope(stream, pl['packet_bytes'], got=want - 2), settings(['A2'], ['D0', 'D1']), pl)
+    assert (res['acq']['transfers'], res['acq']['transfers_wanted']) == (want - 2, want)
+    res = logger.run(FakeScope(stream, pl['packet_bytes']), settings(['A2'], ['D0', 'D1']), pl)
+    assert res['acq']['transfers'] is None                       # an engine that does not say: no number, no error
 
 
 class Clock:

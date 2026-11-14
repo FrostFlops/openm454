@@ -19,9 +19,15 @@ callbacks; RVAs refer to DSWave.exe 1.2.1):
      arrived with it: such an error gets the normal stop handshake and drain, but not the final writes.
 
 Linux charges every submitted EP 0x86 read against the kernel usbfs buffer (usbfs_memory_mb, 16 MiB by default, 0
-= no limit) in full, so a capture whose reads do not all fit is refused before the setup program (USB_NO_MEM, the
-message carries the bytes and the limit) or fails at submit with libusb NO_MEM when other processes hold part of the
-buffer. DSWave runs on Windows, where the USB stack has no such limit.
+= no limit, shared by every USB program): its full length plus the URB bookkeeping and one scatterlist entry per 16 KiB
+(devio.c). When the geometry's queue (cap.transfers_wanted) does not fit, the engine queues as many reads as do
+(cap.transfers), as long as that is at least 4 reads, or at least 2 reads that hold 4 MiB (4 of a capture's ~1 MiB, 3
+of ~2 MB, 2-3 of a live stream's 4-10 MB); below that the capture is refused before the setup program (USB_NO_MEM,
+the message names the minimum and the full queue with the usbfs_memory_mb each needs). A libusb NO_MEM at submit
+(another program holds part of the buffer) keeps the reads already queued when they reach that floor (nothing is
+started yet), otherwise cancels them and raises USB_NO_MEM. A NO_MEM on a resubmit during the run is an error stop like any transfer error
+(DEVICE_ERROR: the scope is left running and the next open stops it), with the usbfs hint. DSWave runs on Windows,
+where the USB stack has no such limit: there the depth is the geometry's and nothing of this applies.
 
 Ctrl+C (SIGINT) during a run only requests the normal stop; KeyboardInterrupt is raised after the device has
 been stopped. Exceptions inside the libusb callback become an error stop instead of being lost. Exceptions from the
@@ -43,7 +49,14 @@ from .errors import DscopeError
 from .transport import HINT_REOPEN, HINT_USBFS, usbfs_memory_mb
 
 HEAD_BYTES = 4096
-MIN_TRANSFERS = 4                 # fewer queued reads starve the pipe on a slow host (same floor as the readout probe)
+MIB = 1024 * 1024
+MIN_TRANSFERS = 4                 # fewer queued ~1 MiB reads starve the pipe on a slow host (as the readout probe)
+MIN_QUEUED_BYTES = 4 * MIB        # ... or fewer, larger reads that hold this much (never fewer than 2)
+URB_OVERHEAD = 512                # devio.c charges sizeof(struct async) + sizeof(struct urb) (~300 B) per read
+SG_ENTRY = 40                     # ... and one struct scatterlist (32 B on x86-64) per 16 KiB of a longer read
+USB_SG = 16384                    # USB_SG_SIZE
+CTRL_RESERVE = 2048               # one control transfer or EP 0x84 read in flight (wLength + ~300 B)
+LIVE_READ = 2 * MIB               # larger reads only come from a live stream above ~100 MB/s (20 ms each)
 HEAD_MAGIC = b'\x55\x55\x55\x55'
 EP_DATA = 0x86
 GAP_BETWEEN_RUNS = 0.100       # FUN_14033f270: 100 ms before every run
@@ -61,14 +74,27 @@ _STATUS = {usb1.TRANSFER_COMPLETED: 'COMPLETED', usb1.TRANSFER_ERROR: 'ERROR', u
            usb1.TRANSFER_OVERFLOW: 'OVERFLOW'}
 
 
+def _charge(nbytes):
+    """What devio.c charges one EP 0x86 read against usbfs: the buffer, the URB bookkeeping and, past 16 KiB, one
+    scatterlist entry per 16 KiB (libusb submits each read as one URB on scatter-gather hosts: xHCI, EHCI)."""
+    sgs = -(-nbytes // USB_SG)
+    return nbytes + URB_OVERHEAD + (SG_ENTRY * sgs if sgs > 1 else 0)
+
+
 def _queued_bytes(pkt_bytes, n_transfers):
-    """What a run submits at once: the head read plus every data read (the kernel charges each of them in full)."""
-    return HEAD_BYTES + n_transfers * pkt_bytes
+    """What a run has charged at once: the head read, every data read and one control transfer in flight."""
+    return _charge(HEAD_BYTES) + n_transfers * _charge(pkt_bytes) + CTRL_RESERVE
+
+
+def _min_transfers(pkt_bytes):
+    """The smallest queue a lowered depth may use: MIN_QUEUED_BYTES in at least 2 reads, never more than
+    MIN_TRANSFERS reads (4 of a capture's ~1 MiB, 3 of ~2 MB, 2 of a live stream's 4-10 MB = 40 ms of data)."""
+    return min(MIN_TRANSFERS, max(2, -(-MIN_QUEUED_BYTES // pkt_bytes)))
 
 
 def _transfers_for(limit_mb, pkt_bytes, want):
     """How many EP 0x86 reads to queue. Only a usbfs budget that cannot hold `want` changes the answer: then as many
-    as fit, never fewer than MIN_TRANSFERS. -> None when not even the floor fits: the caller refuses the run.
+    as fit, never fewer than _min_transfers(). -> None when not even that fits: the caller refuses the run.
 
     The floor is not cosmetic: it keeps a slow host from starving the pipe with one outstanding read, and
     logger.measure_readout() already raises the queue to 4 for its small-packet probe. Measured 2026-11-13 (DSCope
@@ -76,17 +102,25 @@ def _transfers_for(limit_mb, pkt_bytes, want):
     too, so lowering the depth costs nothing that this host can see."""
     if not limit_mb:                         # no usbfs (Windows, macOS) or 0 = no limit: nothing to adapt
         return want
-    n = (limit_mb * 1024 * 1024 - HEAD_BYTES) // pkt_bytes
+    n = (limit_mb * MIB - _charge(HEAD_BYTES) - CTRL_RESERVE) // _charge(pkt_bytes)
     if n >= want:
         return want
-    return int(n) if n >= MIN_TRANSFERS else None
+    return int(n) if n >= _min_transfers(pkt_bytes) else None
 
 
-def _usbfs_error(what, pkt_bytes, n_transfers, limit):
-    """USB_NO_MEM naming the numbers the kernel checks: the bytes this run queues and the usbfs limit in MiB."""
-    return DscopeError('USB_NO_MEM', '%s: %d B of EP 0x86 reads queued at once (%d x %d B + a %d B head), the Linux '
-                       'usbfs buffer is %d MiB' % (what, _queued_bytes(pkt_bytes, n_transfers), n_transfers,
-                                                   pkt_bytes, HEAD_BYTES, limit), HINT_USBFS)
+def _queue(pkt_bytes, n):
+    b = _queued_bytes(pkt_bytes, n)
+    return '%d x %d B + a %d B head = %d B charged, usbfs_memory_mb >= %d' % (n, pkt_bytes, HEAD_BYTES, b, -(-b // MIB))
+
+
+def _usbfs_hint(pkt_bytes):
+    if pkt_bytes > LIVE_READ:
+        return HINT_USBFS + '. For stream, --record-first reads each record in ~1 MiB pieces and needs far less'
+    return HINT_USBFS
+
+
+HINT_USBFS_RUN = ('run the command once more: the next open first stops the run left behind. The scope is fine: the '
+                  'Linux usbfs buffer ran out during the run (another program using USB took part of it). ' + HINT_USBFS)
 
 
 class RawCapture:
@@ -107,6 +141,7 @@ class RawCapture:
         self.stop = None          # 'normal' | 'error' | None (never started)
         self.error = None
         self.transfers = None     # EP 0x86 reads queued at once (the engine lowers it when the usbfs budget is small)
+        self.transfers_wanted = None    # ... the geometry's depth (more than transfers only when it was lowered)
 
     @property
     def head_words(self):
@@ -132,6 +167,8 @@ class Engine:
         self._shutdown = False
         self._stale = []          # transfers that never came back after a cancel (kept alive, never freed)
         self._sigint = False
+        self._limit = None        # usbfs_memory_mb of the current run (None: no usbfs)
+        self._no_mem = None
 
     # ------------------------------------------------------------------ cross-thread control
     def abort(self):
@@ -186,7 +223,10 @@ class Engine:
             try:
                 tr.submit()
             except usb1.USBError as e:
-                self._events.append(('error', 'data transfer resubmit failed: %s' % e))
+                why = 'data transfer resubmit failed: %s' % e
+                if getattr(e, 'value', None) == usb1.ERROR_NO_MEM:
+                    self._no_mem = why          # the host's usbfs buffer, not the device: see _device_error
+                self._events.append(('error', why))
         except BaseException as e:      # noqa: BLE001 - see docstring
             self._events.append(('error', 'exception in the transfer callback: %r' % (e,)))
 
@@ -275,13 +315,18 @@ class Engine:
         wanted = n_transfers
         n_transfers = _transfers_for(limit, pkt_bytes, wanted)
         if n_transfers is None:            # not even the floor fits: refuse, the device stays untouched
-            raise _usbfs_error('refusing this capture before the setup program', pkt_bytes, wanted, limit)
+            raise DscopeError('USB_NO_MEM', 'refusing this capture before the setup program: the Linux usbfs buffer is '
+                              '%d MiB; the EP 0x86 queue needs at least %s (the full queue: %s)'
+                              % (limit, _queue(pkt_bytes, min(_min_transfers(pkt_bytes), wanted)),
+                                 _queue(pkt_bytes, wanted)), _usbfs_hint(pkt_bytes))
         cap = RawCapture()
-        cap.transfers = n_transfers
+        cap.transfers, cap.transfers_wanted = n_transfers, wanted
+        self._limit = limit
         self._events = collections.deque()
         self._stopping = False
         self._full = False
         self._late_error = None
+        self._no_mem = None                 # message of a resubmit that failed with libusb NO_MEM
         self._user_exc = None               # exception from on_chunk / stop_flag (caller code)
         self._trs = []
         self._head_tr = None
@@ -301,12 +346,30 @@ class Engine:
             for _ in range(n_transfers):
                 self._submit(pkt_bytes)
         except usb1.USBError as e:
-            self._stopping = True           # nothing was started: just take the reads back
-            self._cancel_and_wait()
-            limit = usbfs_memory_mb() if getattr(e, 'value', None) == usb1.ERROR_NO_MEM else None
-            if limit:                       # NO_MEM on a host with a usbfs limit: the buffer, not a device problem
-                raise _usbfs_error('libusb NO_MEM while queueing', pkt_bytes, n_transfers, limit)
-            raise DscopeError('USB_ERROR', 'cannot queue EP 0x86 reads: %s' % e, HINT_REOPEN)
+            # NO_MEM on a host with a usbfs limit: the buffer (another program holds part of it), not the device
+            no_mem = limit and getattr(e, 'value', None) == usb1.ERROR_NO_MEM
+            # data reads in flight, by state: getTransfer() itself can raise NO_MEM before _submit appends
+            queued = sum(1 for tr in self._trs if tr is not self._head_tr and tr.isSubmitted())
+            if no_mem and self._head_tr is not None and queued >= _min_transfers(pkt_bytes):
+                for tr in [tr for tr in self._trs if not tr.isSubmitted()]:   # the refused read, if any
+                    self._trs.remove(tr)
+                    try:
+                        tr.close()
+                    except Exception:
+                        pass
+                cap.transfers = queued      # nothing is started yet: run with the reads that fit
+            else:
+                self._stopping = True       # nothing was started: just take the reads back
+                self._cancel_and_wait()
+                if no_mem:
+                    raise DscopeError('USB_NO_MEM', 'libusb NO_MEM after %d of %d EP 0x86 reads were queued (at least '
+                                      '%d are needed): by this count the queue (%s) fits the %d MiB Linux usbfs '
+                                      'buffer, so another program using USB holds part of it (or the kernel charges '
+                                      'more per read)' % (max(queued, 0), n_transfers,
+                                                          min(_min_transfers(pkt_bytes), n_transfers),
+                                                          _queue(pkt_bytes, n_transfers), limit),
+                                      _usbfs_hint(pkt_bytes))
+                raise DscopeError('USB_ERROR', 'cannot queue EP 0x86 reads: %s' % e, HINT_REOPEN)
         time.sleep(SUBMIT_TO_START)
 
         error = None
@@ -325,7 +388,7 @@ class Engine:
             except BaseException as exc:        # a bug in the engine loop: stop like a user stop, then re-raise
                 err = self._finish(cap, None)
                 if err:
-                    raise DscopeError('DEVICE_ERROR', err, HINT_REOPEN) from exc
+                    raise self._device_error(err) from exc
                 raise
             error = self._finish(cap, error)
         finally:
@@ -336,10 +399,17 @@ class Engine:
                 self._cancel_and_wait()
         cap.t_done = time.time()
         if error:
-            raise DscopeError('DEVICE_ERROR', error, HINT_REOPEN) from self._user_exc
+            raise self._device_error(error) from self._user_exc
         if self._user_exc is not None:          # caller code failed: the device was stopped normally first
             raise self._user_exc
         return cap
+
+    def _device_error(self, error):
+        """DEVICE_ERROR after an error stop. A resubmit refused with NO_MEM under a usbfs limit keeps that code (the
+        scope is left running, the next open stops it) but gets the usbfs hint instead of the replug one."""
+        if error == self._no_mem and self._limit:
+            return DscopeError('DEVICE_ERROR', '%s (Linux usbfs buffer, %d MiB)' % (error, self._limit), HINT_USBFS_RUN)
+        return DscopeError('DEVICE_ERROR', error, HINT_REOPEN)
 
     def _finish(self, cap, error):
         """Normal stop when possible, error stop otherwise. Returns the error that remains (None = clean)."""

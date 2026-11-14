@@ -48,8 +48,10 @@ _ABANDONED = []                  # libusb objects that must never be closed or f
 
 def usbfs_memory_mb(path=USBFS_MEMORY):
     """The usbfs buffer limit in MiB (0 = no limit), or None where there is no usbfs (Windows, macOS, no sysfs). Every
-    submitted URB is charged against it, buffer length plus a few hundred bytes of overhead, in drivers/usb/core/devio.c
-    (usbfs_increase_memory_usage), so reads that do not all fit fail in libusb with NO_MEM (-11) at submit time."""
+    submitted URB is charged against it in drivers/usb/core/devio.c (usbfs_increase_memory_usage): its length, plus
+    sizeof(async) + sizeof(urb) (~300 B), plus one scatterlist entry per 16 KiB when the read needs more than one (about
+    2.3 KiB on a 1 MiB read on xHCI); a control transfer in flight is charged too. Reads that do not all fit fail in
+    libusb with NO_MEM (-11) at submit time; acquire._charge budgets the queue the same way."""
     try:
         with open(path, encoding='ascii') as f:
             return int(f.read().strip())

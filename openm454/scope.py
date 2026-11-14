@@ -621,15 +621,18 @@ class Scope:
             # 1024-byte packet no longer fits the remaining buffer (the stream is byte-continuous, so a larger read
             # is harmless)
             pkt = (pkt + EP_MAX_PACKET - 1) // EP_MAX_PACKET * EP_MAX_PACKET
-        # The three caches are committed only after the engine ran: a run refused before the setup program
-        # (USB_NO_MEM) or one that failed while writing must not make the next run skip the front-end waits or
-        # forget an overdriven input.
+        # The three caches are committed only after the engine ran: a run that fails must not make the next run
+        # skip the front-end waits or forget an overdriven input. Only the usbfs precheck (USB_NO_MEM when not even
+        # the minimum queue fits) refuses before the setup program; a failed write, a USB_ERROR or USB_NO_MEM at
+        # submit, a Ctrl+C or an on_chunk/stop_flag exception all come after it.
         try:
             raw = self.engine.run(send, pkt_bytes=pkt, need_bytes=geom['need_bytes'],
                                   n_transfers=geom.get('transfer_count', 16), trigger_timeout=trigger_timeout,
                                   collect_timeout=collect_timeout, settle=settle, **kw)
         except BaseException:
             self._last_cross = None       # unknown how far the writes got: rewrite the CROSS tables next time
+            if not analog_on:             # a digital-only setup program may already have idled the analog front end
+                self._analog_awake = False
             raise
         self._last_cross = cross or None
         self._overdriven = False
@@ -745,7 +748,7 @@ class Scope:
             n = geom[dom + '_depth']
             light = Capture({'kept': False, 'warnings': warnings, 'acq': {
                 'mode': 'roll' if geom.get('roll') else 'single', 'samples': n, 'duration_s': n / geom[dom + '_rate'],
-                't_start_wall': raw.t_start, 'complete': True, 'stop': raw.stop}})
+                't_start_wall': raw.t_start, 'complete': True, 'stop': raw.stop, **queue_depth(raw)}})
             light.build = full
             return light
         return full()
@@ -798,7 +801,7 @@ class Scope:
         acq = {'analog_rate_hz': geom.get('analog_rate'), 'digital_rate_hz': geom.get('digital_rate'),
                'samples': n, 'duration_s': n / rate if rate else 0.0,
                'triggered': bool(raw.triggered), 'attempts': attempts,
-               'stop': getattr(raw, 'stop', None), 'transfers': getattr(raw, 'transfers', None),
+               'stop': getattr(raw, 'stop', None), **queue_depth(raw),
                'handshakes': len(getattr(raw, 'handshakes', [])),
                'complete': self._check_complete(raw, geom),
                'digital_samples': n_d if frame['digital'] else None,
@@ -835,6 +838,14 @@ def _trigger_wait(raw, geom):
     if t0 is None or th is None:
         return 0.0
     return max(0.0, th - t0 - (0.0 if geom.get('roll') else geom.get('record_s', 0.0)))
+
+
+def queue_depth(raw):
+    """acq fields for the EP 0x86 queue: transfers = the reads queued at once; transfers_wanted (the geometry's
+    depth) only when the engine queued fewer, i.e. a Linux usbfs budget that could not hold them all."""
+    n, want = getattr(raw, 'transfers', None), getattr(raw, 'transfers_wanted', None)
+    lowered = n is not None and want is not None and n < want
+    return {'transfers': n, 'transfers_wanted': want} if lowered else {'transfers': n}
 
 
 def _saturated(frame):

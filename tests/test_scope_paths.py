@@ -279,3 +279,83 @@ def test_a_finished_run_commits_the_front_end_state():
     assert s._last_cross == [(0x44, 1)]                           # written: the next run may skip them
     s._run(prog, geom(), 1.0, None)
     assert s.engine.calls[1]['settle'] == 0.0                     # awake and not overdriven: no wait
+
+
+class FlakyEngine(OneShotEngine):
+    """OneShotEngine that raises `fail` on the next run when it is set (once)."""
+
+    def __init__(self, raw):
+        super().__init__(raw)
+        self.fail = None
+
+    def run(self, prog, **kw):
+        self.calls.append(kw)
+        if self.fail is not None:
+            e, self.fail = self.fail, None
+            raise e
+        return self.raw
+
+
+@pytest.mark.parametrize('error', [KeyboardInterrupt(), DscopeError('USB_ERROR', 'submit failed', 'replug'),
+                                   DscopeError('USB_NO_MEM', 'libusb NO_MEM while queueing', 'usbfs_memory_mb')],
+                         ids=['ctrl_c', 'usb_error', 'usb_no_mem_at_submit'])
+def test_a_failed_digital_only_run_makes_the_next_analog_run_wait(error):
+    """These failures come after the setup program, and a digital-only program idles the analog front end: the next
+    analog run must still wait ANALOG_WAKE_SETTLE (it skipped the wait before the fix)."""
+    raw = RawCapture()
+    raw.head = head()
+    s = scope_with(raw)
+    s.engine = FlakyEngine(raw)
+    prog = [(0x44, 1), (0x10, 0x1234)]
+    s._run(prog, geom(), 1.0, None)
+    assert s._analog_awake is True
+    s.engine.fail = error
+    with pytest.raises(type(error)):
+        s._run([(0x10, 0x1234)], geom(analog_rate=None), 1.0, None)
+    assert s._analog_awake is False
+    s._run(prog, geom(), 1.0, None)
+    assert s.engine.calls[-1]['settle'] == scopemod.ANALOG_WAKE_SETTLE
+
+
+def test_a_failed_analog_run_leaves_an_awake_front_end_awake():
+    raw = RawCapture()
+    raw.head = head()
+    s = scope_with(raw)
+    s.engine = FlakyEngine(raw)
+    s._analog_awake = True
+    s.engine.fail = DscopeError('USB_ERROR', 'submit failed', 'replug')
+    with pytest.raises(DscopeError):
+        s._run([(0x44, 1), (0x10, 0x1234)], geom(), 1.0, None)
+    assert s._analog_awake is True
+
+
+@pytest.mark.parametrize('limit', [None, 16], ids=['no_usbfs', 'usbfs_16MiB'])
+def test_geometry_to_engine_queue_depth(monkeypatch, limit):
+    """12 channels at 100 MSa/s, 5 ms through Scope.capture and the real Engine on the simulator: the geometry asks
+    for 16 reads of 1048320 B (16 of those + the head fill 16 MiB exactly), the engine gets them padded to 1 MiB and
+    queues what the usbfs budget allows; without usbfs (Windows, macOS) it keeps the geometry's 16."""
+    from openm454 import acquire as acq
+    from openm454 import cli
+    from test_acquire_sim import FakeDevice, Sim
+    monkeypatch.setattr(acq, 'usbfs_memory_mb', lambda: limit)
+    st = scopemod.settings_from_args(cli.build_parser().parse_args(
+        ['capture', '-c', 'A0-A3,D0-D7', '--rate', '100M', '--duration', '5ms', '--trig-mode', 'force']))
+    s = scopemod.Scope()
+    s.dev = FakeDev()
+    g = s.plan(st)['geometry']
+    assert (g['pkt_bytes'], g['transfer_count']) == (1048320, 16)
+    sim = Sim()
+    eng = acq.Engine(FakeDevice(sim))
+    seen = []
+    s.engine = types.SimpleNamespace(run=lambda prog, **kw: seen.append(kw) or eng.run(prog, **kw))
+    cap = s.capture(st)
+    assert (seen[0]['pkt_bytes'], seen[0]['n_transfers']) == (1 << 20, 16)
+    want = acq._transfers_for(limit, 1 << 20, 16)
+    if limit is None:
+        assert want == 16
+    else:
+        assert acq.MIN_TRANSFERS <= want < 16
+    q = cap.meta['acq']
+    assert q['transfers'] == want and len(eng._trs) == want + 1          # head + the data reads
+    assert q.get('transfers_wanted') == (16 if want < 16 else None)      # named only when lowered
+    assert q['complete'] and q['stop'] == 'normal' and sim.violations == []
