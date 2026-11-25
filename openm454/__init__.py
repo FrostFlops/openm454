@@ -5,7 +5,7 @@ Quick use:
     with Scope() as s:
         cap = s.capture(channels="A1,D0", timebase=500e-6)
 """
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 from .errors import DscopeError  # noqa: F401
 
 
