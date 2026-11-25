@@ -353,6 +353,24 @@ def no_repeat(st, what):
                           'repeat mode is a capture setting (capture --repeat N); set repeat to 0 for %s' % what)
 
 
+# The 20 MHz limit, measured 2026-11-25 (one unit, the same on every range): its corner and its own loss of gain
+# depend on how many analog channels are on. analog channels -> (-3 dB frequency in MHz or None, gain factor)
+BW20_MEASURED = {1: (16.5, 0.978), 2: (24.5, 0.989), 3: (None, 0.994), 4: (None, 0.994)}
+
+
+CAL_UNUSED_HINT = ('a calibration table is installed but was not applied: these volts are uncorrected; add --cal '
+                   '(MCP: leave cal out or pass cal:true) unless raw values are wanted')
+
+
+def bw20_hint(n_analog):
+    """What --bw20 really does with this many analog channels on."""
+    corner, gain = BW20_MEASURED[min(max(n_analog, 1), 4)]
+    where = ('about %g MHz' % corner) if corner else 'above 30 MHz (only -0.9 dB at 20 MHz, -2.5 dB at 30 MHz)'
+    return ('20 MHz limit with %d analog channel%s on: -3 dB at %s, and it lowers the gain at every frequency by '
+            'about %.1f %% (a calibration table with bw20_gain corrects that); the limit is strongest with one '
+            'analog channel (about 16.5 MHz)' % (n_analog, '' if n_analog == 1 else 's', where, (1 - gain) * 100))
+
+
 def hal_config(st, repeat=0):
     """User Settings -> SCPI-level HAL parameters (+ per-channel scaling) -> dict.
 
@@ -395,7 +413,8 @@ def hal_config(st, repeat=0):
                 sc = calib.uncorrected_scale(sc, 'inverted channel: the calibration was measured non-inverted')
             else:
                 entry, used, why = calib.analog_entry(doc, cal_mode, ch, vdiv_v)
-                sc = (calib.corrected_scale(sc, entry, used, why, st.coupling.get(ch, 'dc'), ch in st.bw20)
+                sc = (calib.corrected_scale(sc, entry, used, why, st.coupling.get(ch, 'dc'), ch in st.bw20,
+                                            calib.bw20_gain(doc, cal_mode))
                       if entry else calib.uncorrected_scale(sc, why))
                 if why:
                     warnings.append('calibration: ' + why)
@@ -466,6 +485,10 @@ def hal_config(st, repeat=0):
         lo, hi = calib.threshold_range(doc)
         warnings.append('calibration: threshold %.3g V is outside the calibrated range %.3f .. %.3f V: switching at '
                         'about %.3f V' % (thr, lo, hi, calib.threshold_output(doc, thr_prog)))
+    if any(ch in st.bw20 for ch in st.analog):
+        hints.append(bw20_hint(len(st.analog)))
+    if not st.cal and st.analog and calib.installed() is not None:
+        hints.append(CAL_UNUSED_HINT)
     hal = {'analog': ana, 'digital': [int('D%d' % i in st.digital) for i in range(8)],
            'threshold_uv': int(round(thr_prog * 1e6)),
            'sample_time_ps': time_ps, 'storage_depth': storage, 'auto_rate': 1,

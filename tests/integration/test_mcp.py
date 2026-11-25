@@ -165,7 +165,8 @@ def test_serve_reads_lines_and_answers_calls_in_threads(fake):
     assert r[None]['error']['code'] == -32700                     # the bad line, the server keeps reading
     assert r[1]['result']['protocolVersion'] == M.PROTOCOL_VERSIONS[0]
     assert r[2]['result']['structuredContent'] == {'ok': True, 'cmd': 'info', 'connected': True,
-                                                   'device': {'model': 'DSCope M454'}, 'awg_last': None}
+                                                   'device': {'model': 'DSCope M454'}, 'awg_last': None,
+                                                   'cal': {'installed': False, 'default': 'not applied'}}
 
 
 # ------------------------------------------------------------------------------------------------ tools

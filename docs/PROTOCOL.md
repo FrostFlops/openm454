@@ -108,6 +108,11 @@ register program at `:Work:RUN 0,0`. The driver reproduces that program (`openm4
 against the recorded runs). Key facts:
 
 * **Channel enable**: ANAn_BASE bit0 = enable, 0x4 = DC (AC clears it), 0x8 = 20 MHz limit.
+  The limit bit is all DSWave programs for the limit (the HAL uses the flag nowhere else). What it does depends
+  on the number of enabled analog channels (measured 2026-11-25, every range): -3 dB at about 16.5 MHz with one
+  channel, 24.5 MHz with two, above 30 MHz with three or four (-0.9 dB at 20 MHz), and it lowers the gain at
+  every frequency including DC by 2.2 % / 1.1 % / 0.6 %. Every interleave phase is attenuated alike and the
+  limit bits of the other channels have no effect.
   VERT_AFOLD = (n_enabled << 8) | log2(fold), analog fold x4 / x2 / x1 for 1 / 2 / 3-4 channels.
   VERT_DEN0 = digital enable mask, VERT_DFOLD likewise with digital fold x4 / x2 / x1 for 1-2 / 3-4 / 5-8 channels.
 * **Rates and depth**: S = STORAGEdepth. Base rate = min(100 MHz, S/4 / window) snapped down to 1-2-5

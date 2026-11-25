@@ -66,6 +66,9 @@ def test_placeholder_is_neutral_valid_and_matches_the_packaged_file():
     (lambda d: d.update(awg={'gain': 2.0, 'offset_v': 0}), 'awg.gain'),
     (lambda d: d.update(threshold={'gain': 1.0, 'offset_v': 1.0}), 'threshold.offset_v'),
     (lambda d: d.update(unit_id='XYZ'), 'unit_id'),
+    (lambda d: d.update(bw20_gain={'5': 0.99}), 'bw20_gain mode'),
+    (lambda d: d.update(bw20_gain={'1': 0.5}), 'bw20_gain.1'),
+    (lambda d: d.update(bw20_gain=0.98), 'bw20_gain must be an object'),
 ])
 def test_validate_refuses_typos(mut, word):
     d = calib.placeholder()
@@ -344,6 +347,7 @@ def test_cli_debug_plan_with_cal(capsys):
 
 
 def test_mcp_mapping_and_summary():
+    install(calib.placeholder())                                  # a neutral file: nothing to apply by default
     assert '--cal' in mcp_server.capture_args({'channels': 'A0', 'cal': True})
     assert '--cal' not in mcp_server.capture_args({'channels': 'A0'})
     assert mcp_server.awg_args({'action': 'dc', 'level': '1V', 'cal': True})[-1] == '--cal'
@@ -459,3 +463,96 @@ def test_no_resolution_figure_on_the_glitch_path():
     m = measure.analog(x, 1e6)
     if m.get('period_irregular'):
         assert 'freq_res_hz' not in m
+
+
+# ------------------------------------------------------------------ the 20 MHz limit (measured 2026-11-25)
+def test_bw20_gain_is_folded_in_only_with_the_limit_on_and_per_channel_count_mode():
+    install(table(bw20_gain={'1': 0.978, '2': 0.989, '34': 0.994}))
+    assert not calib.neutral(calib.active())
+    off = hal_config(st_())[1]['A0']
+    on = hal_config(st_(bw20=['A0']))[1]['A0']
+    assert 'bw20_gain' not in off['cal'] and off['cal']['gain'] == 1.04
+    assert on['cal']['bw20_gain'] == 0.978 and on['cal']['gain'] == pytest.approx(1.04 * 0.978)
+    assert on['volts_per_code'] == pytest.approx(off['volts_per_code'] / 0.978)
+    assert on['zero_code'] == off['zero_code']                       # the factor is a gain, the zero stays
+    assert 'not corrected' not in on['cal'].get('note', '')
+    two = hal_config(st_(analog=('A0', 'A1'), bw20=['A0']))[1]
+    assert two['A0']['cal']['gain'] == pytest.approx(1.02 * 0.989)   # the two-channel factor with the two-channel entry
+    assert 'bw20_gain' not in two['A1']['cal']                       # A1 has the limit off
+    four = hal_config(st_(analog=('A0', 'A1', 'A2', 'A3'), bw20=['A0']))[1]['A0']
+    assert four['cal']['gain'] == pytest.approx(1.03 * 0.994)
+
+
+def test_a_table_without_bw20_gain_says_that_the_limit_is_not_corrected():
+    d = table()
+    del d['bw20_gain']                                               # a table written before 2026-11-25
+    install(d)
+    assert calib.validate(d) == [] and calib.bw20_gain(d, '1') is None
+    on = hal_config(st_(bw20=['A0']))[1]['A0']
+    assert on['cal']['gain'] == 1.04 and 'bw20_gain' not in on['cal']
+    assert 'not corrected' in on['cal']['note'] and '20 MHz limit' in on['cal']['note']
+
+
+def test_the_placeholder_factor_of_one_changes_nothing():
+    install(calib.placeholder())
+    a = hal_config(st_(cal=False, bw20=['A0']))[1]['A0']
+    b = hal_config(st_(cal=True, bw20=['A0']))[1]['A0']
+    assert b['volts_per_code'] == a['volts_per_code'] and b['zero_code'] == a['zero_code']
+
+
+@pytest.mark.parametrize('analog, word', [
+    (('A0',), 'about 16.5 MHz'),
+    (('A0', 'A1'), 'about 24.5 MHz'),
+    (('A0', 'A1', 'A2'), 'above 30 MHz'),
+    (('A0', 'A1', 'A2', 'A3'), 'above 30 MHz'),
+])
+def test_the_limit_comes_with_a_hint_about_its_real_corner(analog, word):
+    hints = hal_config(st_(analog=analog, cal=False, bw20=['A0']))[3]
+    assert len([h for h in hints if '20 MHz limit' in h]) == 1
+    h = next(h for h in hints if '20 MHz limit' in h)
+    assert word in h and '%d analog channel' % len(analog) in h
+    assert not [h for h in hal_config(st_(analog=analog, cal=False))[3] if '20 MHz limit' in h]
+    # the limit on a channel that is not recorded says nothing
+    others = [c for c in ('A0', 'A1', 'A2', 'A3') if c not in analog]
+    if others:
+        assert not [h for h in hal_config(st_(analog=analog, cal=False, bw20=others))[3] if '20 MHz limit' in h]
+
+
+# ------------------------------------------------------------------ an installed table is the default (MCP) / hinted (CLI)
+def test_installed_is_quiet_and_only_true_for_a_table_that_corrects_something(tmp_path):
+    assert calib.installed(str(tmp_path / 'none.json')) is None                 # missing: no error
+    bad = tmp_path / 'bad.json'
+    bad.write_text('{not json', encoding='utf-8')
+    assert calib.installed(str(bad)) is None                                     # unreadable: no error
+    install(calib.placeholder())
+    assert calib.installed() is None                                             # neutral corrects nothing
+    install(table())
+    assert calib.installed()['awg']['gain'] == 0.9896
+
+
+def test_mcp_applies_an_installed_table_unless_told_not_to():
+    install(table())
+    assert '--cal' in mcp_server.capture_args({'channels': 'A0'})
+    assert '--cal' not in mcp_server.capture_args({'channels': 'A0', 'cal': False})
+    assert '--cal' in mcp_server.capture_args({'channels': 'A0', 'cal': True})
+    assert mcp_server.awg_args({'action': 'dc', 'level': '1V'})[-1] == '--cal'
+    assert mcp_server.awg_args({'action': 'set', 'wave': 'sine'})[-1] == '--cal'
+    assert '--cal' not in mcp_server.awg_args({'action': 'set', 'wave': 'sine', 'cal': False})
+    assert '--cal' not in mcp_server.awg_args({'action': 'off'})                 # off / status take no options
+    assert '--cal' in mcp_server.record_args({'mode': 'log', 'channels': 'A0'})
+    assert '--cal' not in mcp_server.record_args({'mode': 'log', 'channels': 'A0', 'cal': False})
+    install(calib.placeholder())
+    assert '--cal' not in mcp_server.capture_args({'channels': 'A0'})
+    assert '--cal' not in mcp_server.awg_args({'action': 'dc', 'level': '1V'})
+    assert 'cal.installed' in mcp_server.INSTRUCTIONS
+
+
+def test_a_capture_without_cal_says_when_a_table_was_left_unused():
+    from openm454.scope import CAL_UNUSED_HINT
+    install(table())
+    assert CAL_UNUSED_HINT in hal_config(st_(cal=False))[3]
+    assert CAL_UNUSED_HINT not in hal_config(st_(cal=True))[3]
+    assert CAL_UNUSED_HINT not in hal_config(st_(analog=(), digital=('D0',), cal=False))[3]     # no volts to correct
+    install(calib.placeholder())
+    assert CAL_UNUSED_HINT not in hal_config(st_(cal=False))[3]
+

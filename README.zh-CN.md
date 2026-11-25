@@ -265,9 +265,43 @@ OPENM454_TIMING=gap=0.005,quiet=0.005,setup=0.002,submit=0.005   # 35 ms per cap
 - 触发电平必须在屏幕上(屏幕 ADC 码值 10..245 以内,屏幕以偏移为中心),否则返回 `TRIGGER_OUT_OF_RANGE`(normal 和 auto 模式;使用 `--trig-mode force` 时,屏幕外的电平会被限幅且不报错)。不带电平时,模拟触发使用 `--offset`。
 - 截幅会给出提示(`A1 clips at the top: increase --vdiv or lower --offset`);过驱之后前端需要约 0.2-0.3 s 才能恢复。
 
+### 模拟输入的实际表现(实测)
+
+2026-11-25 在一台设备的全部四个输入上测得(每次两个:先 A0 和 A1,再 A2 和 A3),信号源是一块双通道 14 位 DAC(它的绝对电平没有用万用表核对过,所以这里的数字都是比值)。除非指明量程,结果在 10 mV/div 到 5 V/div 的每个量程上都一样。
+
+- **20 MHz 带宽限制(`--bw20`)。** 它的拐点取决于开启了几个模拟通道,并且它会降低所有频率(包括直流)下的增益:
+
+  | 开启的模拟通道数 | -3 dB 点 | 10 / 20 / 30 MHz 处的衰减 | 开启限制后的增益 |
+  |---|---|---|---|
+  | 1 | 约 16.5 MHz | 1.1 / 3.9 / 7.4 dB | x 0.978 |
+  | 2 | 约 24.5 MHz | 0.4 / 1.9 / 4.4 dB | x 0.989 |
+  | 3 或 4 | 高于 30 MHz | 0.15 / 0.9 / 2.5 dB | x 0.994 |
+
+  开启三个或四个通道时,它几乎算不上 20 MHz 滤波器:需要这个限制时请单独记录该通道。厂商软件写的也是同一个寄存器位,所以这是硬件行为。开启限制的 capture 或 stream 会带一条包含这些数字的提示;校准表中有 `bw20_gain` 时,`--cal` 会修正这部分增益(见[校准](#校准可选))。不交错的 `log`(最高 100 MSa/s)让每个通道各用一个转换器,和开启三个或四个通道时一样,所以无论通道数多少,那里应当适用最后一行(`--cal` 使用该行的系数);这一点没有在 log 中实测过。
+- **慢信号和快信号的增益略有不同。** 相对同一量程的直流增益,正弦波的读数为:
+
+  | 正弦频率 | 5 Hz | 20 Hz | 100 Hz | 1 kHz | 10 kHz | 100 kHz |
+  |---|---|---|---|---|---|---|
+  | A0,1 V/div | +0.1 % | -0.2 % | +0.7 % | +1.0 % | +0.7 % | -0.2 % |
+  | A0,100 mV/div | +0.2 % | -0.1 % | +0.9 % | +1.1 % | +1.1 % | +1.2 % |
+  | A1,1 V/div | +0.1 % | -0.5 % | +0.3 % | +0.5 % | +0.4 % | -0.2 % |
+  | A1,100 mV/div | +0.2 % | -0.4 % | +0.4 % | +0.6 % | +0.7 % | +0.7 % |
+  | A2,1 V/div | 0.0 % | -0.5 % | +0.1 % | +0.3 % | +0.2 % | 0.0 % |
+  | A2,100 mV/div | -0.1 % | -0.6 % | 0.0 % | +0.2 % | +0.3 % | +0.3 % |
+  | A3,1 V/div | +0.1 % | -0.7 % | +0.4 % | +0.7 % | +0.6 % | +0.4 % |
+  | A3,100 mV/div | +0.1 % | -0.7 % | +0.4 % | +0.8 % | +0.8 % | +0.9 % |
+
+  在时域里是同一件事:阶跃刚过,读数先过冲(A0 为阶跃幅度的 0.7-1.0 %,A1 和 A3 为 0.3 %,A2 没有),约 3 ms 内穿过终值,在 5-10 ms 时停在终值的另一侧(A0 为 0.3 %,A1 和 A2 为 0.6 %,A3 为 0.85 %),约 50 ms 后稳定。这个比例对 10 mV/div 下的 60 mV 阶跃和 1 V/div 下的 6 V 阶跃是一样的。`--cal` 修正的是直流增益,所以在这台设备上,约 200 Hz 以上信号的幅度或有效值仍会偏高(A0 约 1.0 %,A3 约 0.7 %,A1 约 0.5 %,A2 约 0.3 %);在大阶跃之后 50 ms 内读取的直流电平,误差最多为该阶跃的 1 %。这些数字属于具体的设备和通道。
+- **过驱。** 在 20-100 mV/div 上加 5.7 V(屏幕范围的 57 到 285 倍)持续 0.5 s 后,读数先停在一个满幅端 2-5 ms,再摆到另一端,0.1 s 后在 2 个码以内,0.2 s 后在 1 个码以内。在 200 mV/div 上(屏幕范围的 7 倍),20-50 ms 后在 2 个码以内。驱动在一次饱和的采集之后等待 0.3 s。
+- **线性度。** 由慢斜坡的码密度测试得到:在每种通道数模式下,积分非线性最多 1.2 个码(单个转换器最多 1.8 个码)。双通道模式下 A1 的两个转换器之一在量程下部弯曲 1.2 个码:那里一个 3 格的台阶在屏幕下半部读数偏大 1 %,在中心附近偏小 1 %;A0、A2 和 A3 没有类似现象(A2 和 A3 最多 0.9 个码)。(偶发的偏差 3-4 个码的采样见"数据与时间"。)使用 `--cal` 时,各量程之间一致在约 0.5 % 以内(20 mV/div 及以下:1.5 %)。
+- **通道之间**(双通道模式,1 V/div)。A0 对 A1,通过交换两根线消去了信号源自身的差异:延时 0.1 ns,使用 `--cal` 时增益比 0.999。A2 对 A3,信号源的通道间延时取自上面那次测量:0.3 ns。使用 `--cal` 时,四个输入的直流增益一致在约 0.7 % 以内。
+- **数据与时间。** 对一个每 8 ns 走一步的斜坡逐点跟踪,没有发现缺口或重复的数据块:单次采集 4 亿采样(单通道,400 MSa/s)、2 x 2 亿(双通道)和 4 x 1 亿(四通道),以及 120 s 的无缝 `log`(单通道 100 MSa/s 共 120 亿采样;双通道 50 MSa/s 共 2 x 60 亿;用 `--hook` 检查)。斜坡的每个周期长度都在 2 个采样以内。在交错模式下(开启一个或两个通道),大约每两百万个采样中有一个偏差 3-4 个码,总是出现在少数几个码上;开启三个或四个通道时没有出现。100、200 和 400 MSa/s 模式下的采样时钟一致在 0.06 ppm 以内。
+- **触发灵敏度**(`--sensitivity`,默认 5):每次都能触发的最小 1 kHz 正弦,峰峰值在 0 时为 0.05 格,5 时为 0.3 格,10 时为 0.6 格,15 时为 1.0 格;1 MHz 下,0 时为 0.05 格,5-15 时为 0.2 格。边沿触发在 30 MHz 正弦上仍能触发。
+- **模拟通道上的脉宽触发。** `pulse<` 和 `npulse<` 在设定的宽度处切换。设定值为 10 us 或更长时,`pulse>` 和 `npulse>` 对比设定值略短的脉冲就已经触发:10 us 时从低 32-96 ns 起,100 us 时从低 0.3-1 us 起,1 ms 时从低 1-3 us 起(0.1-0.6 %)。在 200 ns 和 1 us 时,两类触发都在设定值的 8 ns 以内切换。
+
 ## 校准(可选)
 
-对测得电压的可选 PC 端修正。默认关闭,也绝不写入设备:设备 EEPROM 不会被触碰,示波器自己的零点校准仍然生效;这些修正叠加在它之上,在 PC 端进行。不带 `--cal` 时一切不变(没有新键,寄存器程序相同)。
+对测得电压的可选 PC 端修正。没有安装校准表时什么都不应用;命令行上不加 `--cal` 就不生效,MCP 工具则在安装了校准表时默认应用(调用中写 `cal: false` 可关闭)。它绝不写入设备:设备 EEPROM 不会被触碰,示波器自己的零点校准仍然生效;这些修正叠加在它之上,在 PC 端进行。不带 `--cal` 时一切不变(没有新键,寄存器程序相同)。
 
 ### 文件与命令
 
@@ -282,7 +316,7 @@ OPENM454_TIMING=gap=0.005,quiet=0.005,setup=0.002,submit=0.005   # 35 ms per cap
 
 ### 使用
 
-`--cal` 被 `capture`、`watch`、`stream`、`log`、`debug plan`(共用的垂直选项)以及每个 `awg` 子命令(`set`、`sweep`、`burst`、`mod`、`dc`)接受。`capture`、`watch`、`stream` 和 `log` 上的 `--awg 'WAVE,...'` 跟随该命令的 `--cal`。MCP 服务器在 `capture`、`log_plan`、`record_start` 和 `awg` 上有布尔参数 `cal`(默认 false)。
+`--cal` 被 `capture`、`watch`、`stream`、`log`、`debug plan`(共用的垂直选项)以及每个 `awg` 子命令(`set`、`sweep`、`burst`、`mod`、`dc`)接受。`capture`、`watch`、`stream` 和 `log` 上的 `--awg 'WAVE,...'` 跟随该命令的 `--cal`。MCP 服务器在 `capture`、`log_plan`、`record_start` 和 `awg` 上有布尔参数 `cal`。它的默认值跟随校准文件:安装了有实际修正内容的表时,除非调用中写明 `cal: false`,这些工具都会应用它(`status` 显示 `cal.installed`);没有文件或只有中性占位表时不应用。命令行上 `--cal` 仍需显式给出;在已安装校准表的情况下不带它做的采集会带一条提示。
 
 带 `--cal` 时:
 
@@ -303,6 +337,8 @@ V = ((code - zero_code) - (zero_lsb + slope * offset_div)) / gain * volts_per_co
 `volts_per_code` = V/div x 8/235(1 LSB);`offset_div` 是以格为单位的偏移。
 
 - 开启 1 个或 2 个模拟通道的模式若没有条目,则回退到 `34` 条目,并给出说明和警告。完全没有条目:该通道不修正,并给出警告。反相的通道保持不修正。交流耦合和 `--bw20` 会被修正但有说明:该表是在直流耦合和全带宽下测得的。
+- 20 MHz 限制会降低增益(见[模拟输入的实际表现](#模拟输入的实际表现实测))。某通道开启 `--bw20` 时,它的增益会再乘以表中对应当前通道数模式的 `bw20_gain`,该通道的记录中会显示 `bw20_gain`;表中没有这一项时,限制不被修正,并在说明中写明。
+- 该表修正的是直流增益。约 200 Hz 以上的信号读数可能偏高最多约 1 %(同一节)。
 - 不交错的 `log`(最高 100 MSa/s)使用 `34` 表。
 - 使用 10x 探头时,该表作用于 BNC 处;探头自身的倍率不被修正。
 - 请让输入保持在绝对值约 +-7 格以内:偏移较大时,前端在此之上会压缩。
@@ -313,16 +349,19 @@ JSON:`format` 为 `openm454-calibration`,`version` 为 1,`unit_id`(null 或 16 �
 
 ```
 "analog": {mode: {channel: {vdiv_key: {"gain": g, "zero_lsb": z, "offset_slope_lsb_per_div": s}}}},
+"bw20_gain": {mode: g},
 "awg": {"gain": g, "offset_v": o},
 "threshold": {"gain": g, "offset_v": o}
 ```
 
 - `mode`:`1`(开启一个模拟通道)、`2`(两个)、`34`(三个或四个)。`channel`:`A0`-`A3`。`vdiv_key`:BNC 处的硬件 V/div,以伏特的 `%g` 写法:`0.001`、`0.002`、`0.005`、`0.01`、`0.02`、`0.05`、`0.1`、`0.2`、`0.5`、`1`、`2`、`5`。
+- `bw20_gain`(可选):开启 20 MHz 限制时通道的增益除以关闭时的增益,按模式给出(在一台设备上测得:`1`、`2`、`34` 分别为 0.978、0.989、0.994;占位表中为 1)。没有这一项的表仍然可以加载。
 - 界限,加载时超出会以 `CAL_INVALID` 拒绝:
 
   | 条目 | 增益 | 偏移 |
   |---|---|---|
   | analog | 0.8 .. 1.25 | `zero_lsb` 在 +-30 以内,`offset_slope_lsb_per_div` 在 +-2 以内 |
+  | `bw20_gain` | 0.9 .. 1.02 | - |
   | `awg` | 0.9 .. 1.1 | `offset_v` 在 +-0.1 V 以内 |
   | `threshold` | 0.8 .. 1.2 | `offset_v` 在 +-0.3 V 以内 |
 
@@ -332,7 +371,7 @@ JSON:`format` 为 `openm454-calibration`,`version` 为 1,`unit_id`(null 或 16 �
 
 ### 在哪里显示
 
-- `capture`、`stream`、`analyze` 的输出和 MCP 摘要中的 `applied.cal`(`log` 则在计划、`started` 行和结果中为 `plan.cal`,其保存的文件中为 `applied.cal`):`enabled`、`file`、`unit_id`、`created`、`neutral`、`mode`、`threshold`(`target_v`、`programmed_v`,限幅时还有 `requested_v`、`clamped`)和 `analog`:每通道一条记录(`applied`、`mode`、`gain`、`zero_lsb`、`offset_slope_lsb_per_div`、`offset_div`、`zero_code_raw`、`volts_per_code_raw`、`note`),或 `applied: false` 加 `reason`。`applied.threshold_v` 是目标值,`applied.threshold_programmed_v` 是实际编程的值。
+- `capture`、`stream`、`analyze` 的输出和 MCP 摘要中的 `applied.cal`(`log` 则在计划、`started` 行和结果中为 `plan.cal`,其保存的文件中为 `applied.cal`):`enabled`、`file`、`unit_id`、`created`、`neutral`、`mode`、`threshold`(`target_v`、`programmed_v`,限幅时还有 `requested_v`、`clamped`)和 `analog`:每通道一条记录(`applied`、`mode`、`gain`、`zero_lsb`、`offset_slope_lsb_per_div`、`offset_div`、`zero_code_raw`、`volts_per_code_raw`、`note`,以及当限制的系数已并入 `gain` 时的 `bw20_gain`),或 `applied: false` 加 `reason`。`applied.threshold_v` 是目标值,`applied.threshold_programmed_v` 是实际编程的值。
 - `awg.cal`:`requested_v`、`programmed_v`、`expected_v`、`gain`、`offset_v`、`unit_id`、`neutral`,限幅时还有 `clamped` / `warning`。
 - 保存的 `.npz` 文件带有元数据 `cal` 和修正后的刻度,所以 `analyze` 和 `plot` 用文件中保存的修正重新换算,绝不用当前的文件。`plot` 把 y 轴标为 `V (calibrated)`。
 
@@ -574,12 +613,12 @@ claude mcp add -s user openm454 -e "OPENM454_DSWAVE=<folder>" -- openm454-mcp
 | 工具 | 运行 | 主要参数(默认值) |
 |---|---|---|
 | `status` | `info` | 无。是否已连接?型号、USB 速度、固件 / FPGA 状态、上次的信号发生器设置 |
-| `capture` | `capture` | `channels`(`A0-A3,D0-D7`)、`timebase` / `duration` / `rate` / `samples`、`trigger`(`SRC:EDGE[:LEVEL]`)、`trig_mode`(有触发时为 `normal`,无触发时为 `force`)、`timeout_s`(5)、`trig_pos`、`holdoff`、`trig_retries`(4)、`decode`、`edges`、`window`、`save`(true)、`plot`(true)、垂直选项(`vdiv`、`offset`、`probe`、`coupling`、`bw20`、`threshold`)、`cal`(false)。每通道的频率、Vpp、最小/最大/平均值、占空比、上升/下降时间(数字通道:状态、频率、占空比、边沿数)、触发结果、解码帧、文件路径。未触发时返回 `TIMEOUT_NO_TRIGGER` |
+| `capture` | `capture` | `channels`(`A0-A3,D0-D7`)、`timebase` / `duration` / `rate` / `samples`、`trigger`(`SRC:EDGE[:LEVEL]`)、`trig_mode`(有触发时为 `normal`,无触发时为 `force`)、`timeout_s`(5)、`trig_pos`、`holdoff`、`trig_retries`(4)、`decode`、`edges`、`window`、`save`(true)、`plot`(true)、垂直选项(`vdiv`、`offset`、`probe`、`coupling`、`bw20`、`threshold`)、`cal`(安装了校准表时默认开启)。每通道的频率、Vpp、最小/最大/平均值、占空比、上升/下降时间(数字通道:状态、频率、占空比、边沿数)、触发结果、解码帧、文件路径。未触发时返回 `TIMEOUT_NO_TRIGGER` |
 | `analyze` | `analyze` | `file`(必需)、`channels`、`window`、`edges`、`decode`;对保存的 `.npz` 做测量 |
 | `plot` | `plot` | `file`(必需)、`channels`、`window`、`out`;返回 `.png` 路径 |
-| `awg` | `awg set` / `dc` / `off` / `status` | `action`(必需:`set`、`dc`、`off`、`status`);`wave`、`freq`、`high`、`low`(或 `vpp`、`dc`)、`duty`、`phase`;`dc` 用 `level`;`cal`(false)。调用结束后输出仍保持运行 |
+| `awg` | `awg set` / `dc` / `off` / `status` | `action`(必需:`set`、`dc`、`off`、`status`);`wave`、`freq`、`high`、`low`(或 `vpp`、`dc`)、`duty`、`phase`;`dc` 用 `level`;`cal`(安装了校准表时默认开启)。调用结束后输出仍保持运行 |
 | `log_plan` | `log --plan` | `rate`(必需)、`channels`、`duration`、`every`、`storage`、`keep_last`、`force`、垂直选项;无需设备 |
-| `record_start` | 在后台运行 `log` 或 `stream` | `mode`(必需:`log` 或 `stream`)、`channels`、`rate`、`duration`、`every`、`storage`(log:`ram` / `disk` / `none`;stream:仅 `none`,不保存)、`keep_last`、`force` 和 `hook`(仅 log;一个钩子文件,此时 `record_status` 会返回它的 `events`)、`decode`(仅 stream)、垂直选项(`vdiv`、`offset`、`probe`、`coupling`、`bw20`、`threshold`)、`cal`(false);返回任务 id。同一时间只能有一个记录,期间示波器处于忙状态 |
+| `record_start` | 在后台运行 `log` 或 `stream` | `mode`(必需:`log` 或 `stream`)、`channels`、`rate`、`duration`、`every`、`storage`(log:`ram` / `disk` / `none`;stream:仅 `none`,不保存)、`keep_last`、`force` 和 `hook`(仅 log;一个钩子文件,此时 `record_status` 会返回它的 `events`)、`decode`(仅 stream)、垂直选项(`vdiv`、`offset`、`probe`、`coupling`、`bw20`、`threshold`)、`cal`(安装了校准表时默认开启);返回任务 id。同一时间只能有一个记录,期间示波器处于忙状态 |
 | `record_status` | 无(读取任务的输出) | `job`(最近一个)、`lines`(3);最近的状态行,完成后给出结果;带 `hook` 时还有 `events` 和 `events_seen` |
 | `record_stop` | `stop` | `job`、`wait_s`(120);干净地停止并返回结果 |
 | `release` | `release` | 无;释放被崩溃的程序遗留在运行状态的示波器 |

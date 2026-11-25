@@ -511,11 +511,80 @@ or trigger on an analog channel, whose trigger has a noise margin.
 - Clipping gives a hint (`A1 clips at the top: increase --vdiv or lower --offset`); the front end needs ~0.2-0.3 s to
   recover after an overdrive.
 
+### What the analog inputs do (measured)
+
+Measured 2026-11-25 on one unit, on all four inputs (two at a time: A0 with A1, then A2 with A3), with a two-channel
+14-bit DAC as the source (its absolute level was not checked against a meter, so every number here is a ratio).
+Unless a range is named, the result was the same on every range from 10 mV/div to 5 V/div.
+
+- **20 MHz limit (`--bw20`).** Its corner depends on how many analog channels are on, and it lowers the gain at every
+  frequency, DC included:
+
+  | Analog channels on | -3 dB at | Loss at 10 / 20 / 30 MHz | Gain with the limit on |
+  |---|---|---|---|
+  | 1 | about 16.5 MHz | 1.1 / 3.9 / 7.4 dB | x 0.978 |
+  | 2 | about 24.5 MHz | 0.4 / 1.9 / 4.4 dB | x 0.989 |
+  | 3 or 4 | above 30 MHz | 0.15 / 0.9 / 2.5 dB | x 0.994 |
+
+  With three or four channels on it is hardly a 20 MHz filter: record the channel alone when the limit matters. The
+  vendor software programs the same single register bit, so this is the hardware. A capture or stream with the
+  limit on carries a hint with these numbers, and `--cal` corrects the gain when the table has `bw20_gain`
+  (see [Calibration](#calibration-opt-in)). A `log` without interleave (up to 100 MSa/s) runs every channel on
+  its own converter, as with three or four channels on, so the last row should apply there whatever the number of
+  channels (`--cal` uses that row's factor); this was not measured in a log.
+- **Slow and fast signals have slightly different gains.** Against the DC gain of the same range a sine reads:
+
+  | Sine at | 5 Hz | 20 Hz | 100 Hz | 1 kHz | 10 kHz | 100 kHz |
+  |---|---|---|---|---|---|---|
+  | A0, 1 V/div | +0.1 % | -0.2 % | +0.7 % | +1.0 % | +0.7 % | -0.2 % |
+  | A0, 100 mV/div | +0.2 % | -0.1 % | +0.9 % | +1.1 % | +1.1 % | +1.2 % |
+  | A1, 1 V/div | +0.1 % | -0.5 % | +0.3 % | +0.5 % | +0.4 % | -0.2 % |
+  | A1, 100 mV/div | +0.2 % | -0.4 % | +0.4 % | +0.6 % | +0.7 % | +0.7 % |
+  | A2, 1 V/div | 0.0 % | -0.5 % | +0.1 % | +0.3 % | +0.2 % | 0.0 % |
+  | A2, 100 mV/div | -0.1 % | -0.6 % | 0.0 % | +0.2 % | +0.3 % | +0.3 % |
+  | A3, 1 V/div | +0.1 % | -0.7 % | +0.4 % | +0.7 % | +0.6 % | +0.4 % |
+  | A3, 100 mV/div | +0.1 % | -0.7 % | +0.4 % | +0.8 % | +0.8 % | +0.9 % |
+
+  The same thing in time: right after a step the reading overshoots (0.7-1.0 % of the step on A0, 0.3 % on A1 and
+  A3, nothing on A2), passes the final value within about 3 ms, sits on the other side of it at 5-10 ms (0.3 % on
+  A0, 0.6 % on A1 and A2, 0.85 % on A3) and is settled after about 50 ms. The fraction is the same for a 60 mV step
+  at 10 mV/div and a 6 V step at 1 V/div. `--cal` corrects the DC gain, so an amplitude or RMS value of a signal
+  above ~200 Hz still reads high on this unit (about 1.0 % on A0, 0.7 % on A3, 0.5 % on A1, 0.3 % on A2), and a DC
+  level read within 50 ms of a large step is off by up to 1 % of that step. The numbers belong to the unit and the
+  channel.
+- **Overdrive.** After 0.5 s at 5.7 V on 20-100 mV/div (57 to 285 times the screen) the reading sits at one rail
+  for 2-5 ms, swings to the other, and is within 2 codes after 0.1 s and within 1 code after 0.2 s. At 200 mV/div
+  (7 times the screen) it is within 2 codes after 20-50 ms. The driver waits 0.3 s after a saturated capture.
+- **Linearity.** From a code-density test on a slow ramp: the integral non-linearity is at most 1.2 codes in every
+  channel-count mode (single converters up to 1.8 codes). One of the two converters of A1 in the two-channel mode bows
+  by 1.2 codes in the lower part of its range: there a 3-division step reads 1 % large in the lower half of the
+  screen and 1 % small around the centre; A0, A2 and A3 show nothing like it (at most 0.9 codes on A2 and A3).
+  (The rare samples that read 3-4 codes off are described under "Data and time".)
+  With `--cal` the ranges agree with each other within about 0.5 % (20 mV/div and below: 1.5 %).
+- **Between channels** (two-channel mode, 1 V/div). A0 against A1, with the source's own differences removed by
+  swapping the cables: delay 0.1 ns, gain ratio 0.999 with `--cal`. A2 against A3, with the source's channel delay
+  taken from that measurement: 0.3 ns. With `--cal` all four inputs agree in DC gain within about 0.7 %.
+- **Data and time.** A ramp that steps every 8 ns was followed sample by sample without finding a gap or a repeated
+  block: in single captures of 400 M samples (one channel, 400 MSa/s), 2 x 200 M (two channels) and 4 x 100 M (four
+  channels), and through 120 s of gap-free `log` (12 000 M samples of one channel at 100 MSa/s; 2 x 6 000 M of two
+  channels at 50 MSa/s; checked by a `--hook`). Every period of the ramp had its length within 2 samples. In the
+  interleaved modes (one or two channels on) about one sample in two million reads 3-4 codes off, always at one of
+  a few codes; with three or four channels on there was none. The sample clock is the same in the 100, 200 and
+  400 MSa/s modes within 0.06 ppm.
+- **Trigger sensitivity** (`--sensitivity`, default 5): the smallest 1 kHz sine that triggers every time is 0.05 div
+  peak to peak at 0, 0.3 div at 5, 0.6 div at 10 and 1.0 div at 15; at 1 MHz 0.05 div at 0 and 0.2 div at 5-15. An
+  edge trigger still fires on a 30 MHz sine.
+- **Pulse-width triggers on an analog channel.** `pulse<` and `npulse<` switch at the set width. `pulse>` and
+  `npulse>` already fire for pulses a little shorter than the setting once it is 10 us or longer: from 32-96 ns
+  below at 10 us, 0.3-1 us below at 100 us, 1-3 us below at 1 ms (0.1-0.6 %). At 200 ns and 1 us both kinds switch
+  within 8 ns of the setting.
+
 ## Calibration (opt-in)
 
-An optional, PC-side correction of the measured volts. It is off by default and never written to the device: the
-device EEPROM is untouched and the scope's own zero calibration still applies; the corrections act on top of it, on
-the PC. Without `--cal` nothing changes (no new keys, the same register program).
+An optional, PC-side correction of the measured volts. Nothing is applied until a table is installed, and it is never
+written to the device: the device EEPROM is untouched and the scope's own zero calibration still applies; the
+corrections act on top of it, on the PC. On the command line it stays off without `--cal` (no new keys, the same
+register program); the MCP tools apply an installed table unless a call says `cal: false`.
 
 ### The file and the commands
 
@@ -533,8 +602,11 @@ the PC. Without `--cal` nothing changes (no new keys, the same register program)
 
 `--cal` is accepted by `capture`, `watch`, `stream`, `log`, `debug plan` (the shared vertical options) and every
 `awg` subcommand (`set`, `sweep`, `burst`, `mod`, `dc`). An `--awg 'WAVE,...'` spec on `capture`, `watch`, `stream` and
-`log` follows the command's `--cal`. The MCP server has a boolean `cal` (default false) on `capture`, `log_plan`,
-`record_start` and `awg`.
+`log` follows the command's `--cal`. The MCP server has a boolean `cal` on `capture`, `log_plan`, `record_start` and
+`awg`. Its default follows the file: when a table that corrects something is installed the tools apply it unless
+the call says `cal: false` (`status` shows `cal.installed`); with no file or the neutral placeholder nothing is
+applied. On the command line `--cal` stays opt-in, and a capture taken without it while a table is installed
+carries a hint saying so.
 
 With `--cal`:
 
@@ -564,6 +636,11 @@ V = ((code - zero_code) - (zero_lsb + slope * offset_div)) / gain * volts_per_co
 - A mode with one or two analog channels on and no entry falls back to the `34` entry, with a note and a warning. No
   entry at all: that channel is uncorrected, with a warning. Inverted channels stay uncorrected. AC coupling and
   `--bw20` are corrected but noted: the table is measured with DC coupling and full bandwidth.
+- The 20 MHz limit lowers the gain (see [What the analog inputs do](#what-the-analog-inputs-do-measured)). With
+  `--bw20` on a channel its gain is multiplied by the table's `bw20_gain` for the channel-count mode in use, and
+  the channel's record shows `bw20_gain`; a table without that entry leaves the limit uncorrected and says so in
+  the note.
+- The table corrects the DC gain. Signals above ~200 Hz can read up to about 1 % higher (same section).
 - `log` without interleave (up to 100 MSa/s) uses the `34` table.
 - With a 10x probe the table applies at the BNC; the probe's own ratio is not corrected.
 - Keep inputs within about +-7 divisions absolute: the front end compresses above that with large offsets.
@@ -574,17 +651,22 @@ JSON: `format` `openm454-calibration`, `version` 1, `unit_id` (null or 16 lower-
 
 ```
 "analog": {mode: {channel: {vdiv_key: {"gain": g, "zero_lsb": z, "offset_slope_lsb_per_div": s}}}},
+"bw20_gain": {mode: g},
 "awg": {"gain": g, "offset_v": o},
 "threshold": {"gain": g, "offset_v": o}
 ```
 
 - `mode`: `1` (one analog channel on), `2` (two), `34` (three or four). `channel`: `A0`-`A3`. `vdiv_key`: the hardware
   V/div at the BNC as `%g` of volts: `0.001`, `0.002`, `0.005`, `0.01`, `0.02`, `0.05`, `0.1`, `0.2`, `0.5`, `1`, `2`, `5`.
+- `bw20_gain` (optional): the gain of a channel with the 20 MHz limit on divided by its gain with the limit off,
+  per mode (measured on one unit: 0.978, 0.989, 0.994 for `1`, `2`, `34`; the placeholder has 1). A table without
+  it still loads.
 - Bounds, refused on load with `CAL_INVALID`:
 
   | Entry | Gain | Offset |
   |---|---|---|
   | analog | 0.8 .. 1.25 | `zero_lsb` within +-30, `offset_slope_lsb_per_div` within +-2 |
+  | `bw20_gain` | 0.9 .. 1.02 | - |
   | `awg` | 0.9 .. 1.1 | `offset_v` within +-0.1 V |
   | `threshold` | 0.8 .. 1.2 | `offset_v` within +-0.3 V |
 
@@ -600,7 +682,8 @@ anything is sent (`capture`, `watch`, `stream`, `log`, `awg`). A file without `u
   plan, the `started` line and the result, and `applied.cal` in its saved files): `enabled`, `file`,
   `unit_id`, `created`, `neutral`, `mode`, `threshold` (`target_v`, `programmed_v`, and `requested_v`, `clamped` when
   clamped) and `analog`: per channel the record (`applied`, `mode`, `gain`, `zero_lsb`, `offset_slope_lsb_per_div`,
-  `offset_div`, `zero_code_raw`, `volts_per_code_raw`, `note`), or `applied: false` with a `reason`.
+  `offset_div`, `zero_code_raw`, `volts_per_code_raw`, `note`, and `bw20_gain` when the limit's factor is inside
+  `gain`), or `applied: false` with a `reason`.
   `applied.threshold_v` is the target and `applied.threshold_programmed_v` what was programmed.
 - `awg.cal`: `requested_v`, `programmed_v`, `expected_v`, `gain`, `offset_v`, `unit_id`, `neutral`, and `clamped` /
   `warning` when clamped.
@@ -948,12 +1031,12 @@ so the scope is opened and released per call, a hang never blocks the server, an
 | Tool | Runs | Key arguments (defaults) |
 |---|---|---|
 | `status` | `info` | none. Connected? model, USB speed, firmware / FPGA state, last generator setting |
-| `capture` | `capture` | `channels` (`A0-A3,D0-D7`), `timebase` / `duration` / `rate` / `samples`, `trigger` (`SRC:EDGE[:LEVEL]`), `trig_mode` (`normal` with a trigger, `force` without), `timeout_s` (5), `trig_pos`, `holdoff`, `trig_retries` (4), `decode`, `edges`, `window`, `save` (true), `plot` (true), the vertical options (`vdiv`, `offset`, `probe`, `coupling`, `bw20`, `threshold`), `cal` (false). Per channel frequency, Vpp, min/max/mean, duty, rise/fall (digital: state, frequency, duty, edges), trigger result, decoded frames, file paths. A trigger that does not fire gives `TIMEOUT_NO_TRIGGER` |
+| `capture` | `capture` | `channels` (`A0-A3,D0-D7`), `timebase` / `duration` / `rate` / `samples`, `trigger` (`SRC:EDGE[:LEVEL]`), `trig_mode` (`normal` with a trigger, `force` without), `timeout_s` (5), `trig_pos`, `holdoff`, `trig_retries` (4), `decode`, `edges`, `window`, `save` (true), `plot` (true), the vertical options (`vdiv`, `offset`, `probe`, `coupling`, `bw20`, `threshold`), `cal` (on when a table is installed). Per channel frequency, Vpp, min/max/mean, duty, rise/fall (digital: state, frequency, duty, edges), trigger result, decoded frames, file paths. A trigger that does not fire gives `TIMEOUT_NO_TRIGGER` |
 | `analyze` | `analyze` | `file` (required), `channels`, `window`, `edges`, `decode`; measurements of a saved `.npz` |
 | `plot` | `plot` | `file` (required), `channels`, `window`, `out`; returns the `.png` path |
-| `awg` | `awg set` / `dc` / `off` / `status` | `action` (required: `set`, `dc`, `off`, `status`); `wave`, `freq`, `high`, `low` (or `vpp`, `dc`), `duty`, `phase`; `level` for `dc`; `cal` (false). The output keeps running after the call |
+| `awg` | `awg set` / `dc` / `off` / `status` | `action` (required: `set`, `dc`, `off`, `status`); `wave`, `freq`, `high`, `low` (or `vpp`, `dc`), `duty`, `phase`; `level` for `dc`; `cal` (on when a table is installed). The output keeps running after the call |
 | `log_plan` | `log --plan` | `rate` (required), `channels`, `duration`, `every`, `storage`, `keep_last`, `force`, the vertical options; no device needed |
-| `record_start` | `log` or `stream` in the background | `mode` (required: `log` or `stream`), `channels`, `rate`, `duration`, `every`, `storage` (log: `ram` / `disk` / `none`; stream: only `none`, nothing saved), `keep_last`, `force` and `hook` (log only; a hook file, `record_status` then returns its `events`), `decode` (stream only), the vertical options (`vdiv`, `offset`, `probe`, `coupling`, `bw20`, `threshold`), `cal` (false); returns a job id. One recording at a time, the scope is busy meanwhile |
+| `record_start` | `log` or `stream` in the background | `mode` (required: `log` or `stream`), `channels`, `rate`, `duration`, `every`, `storage` (log: `ram` / `disk` / `none`; stream: only `none`, nothing saved), `keep_last`, `force` and `hook` (log only; a hook file, `record_status` then returns its `events`), `decode` (stream only), the vertical options (`vdiv`, `offset`, `probe`, `coupling`, `bw20`, `threshold`), `cal` (on when a table is installed); returns a job id. One recording at a time, the scope is busy meanwhile |
 | `record_status` | none (reads the job's output) | `job` (the latest), `lines` (3); latest status lines, and the result once done; with a `hook`, also `events` and `events_seen` |
 | `record_stop` | `stop` | `job`, `wait_s` (120); stops cleanly and returns the result |
 | `release` | `release` | none; frees a scope left running by a crashed program |

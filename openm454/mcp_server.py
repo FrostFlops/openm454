@@ -46,7 +46,9 @@ Never assume the wiring or the bench setup: what each input and the generator ou
 attenuation, other instruments. Ask the user whenever it is not stated in this conversation, and again after anything
 may have changed (a new session, a pause, a rewiring); state/fixture.json, earlier sessions and test declarations can
 be stale. Ask before connecting probes or the generator output to their circuit, and before driving the generator into
-anything not confirmed. Errors have a code: NOT_FOUND = not connected, BUSY = another program holds the scope,
+anything not confirmed. When a calibration table is installed (`status` shows `cal.installed`), `capture`, `log_plan`,
+`record_start` and `awg` apply it by default: leave `cal` out; pass `cal: false` only for raw values.
+Errors have a code: NOT_FOUND = not connected, BUSY = another program holds the scope,
 TIMEOUT_NO_TRIGGER = no trigger within timeout_s."""
 
 VERTICAL = {
@@ -54,9 +56,10 @@ VERTICAL = {
     'offset': {'type': 'string', 'description': "voltage at the vertical centre: '1.5V' or 'A1=1.5V'"},
     'probe': {'type': 'string', 'description': "probe factor: '10x' or 'A2=10x' (default 1x)"},
     'coupling': {'type': 'string', 'description': "'dc' / 'ac' or per channel 'A1=ac'"},
-    'bw20': {'type': 'string', 'description': 'channels with the 20 MHz bandwidth limit, e.g. A1,A2'},
+    'bw20': {'type': 'string', 'description': 'channels with the 20 MHz bandwidth limit, e.g. A1,A2 (corner about '
+             '16.5 MHz with one analog channel on, 24.5 MHz with two, above 30 MHz with three or four)'},
     'threshold': {'type': 'string', 'description': "digital input threshold 0..5 V (default '1.4V')"},
-    'cal': {'type': 'boolean', 'description': "apply this unit's calibration file (installed with 'openm454 cal import'): corrected volts, trigger level, threshold and generator levels; default false (the result's applied.cal says what was corrected)"},
+    'cal': {'type': 'boolean', 'description': "apply this unit's calibration file (installed with 'openm454 cal import'): corrected volts, trigger level, threshold and generator levels. Default: true when a calibration table that corrects something is installed (status shows cal.installed), else false; pass false only when raw, uncorrected values are wanted (the result's applied.cal says what was corrected)"},
 }
 DECODE = {'type': 'array', 'items': {'type': 'string'},
           'description': "protocol decoders: 'uart:rx=D4,baud=115200', 'spi:clk=D1,mosi=D3,miso=D2,cs=D0,mode=0', "
@@ -127,7 +130,7 @@ TOOLS = [
                              'high': {'type': 'string'}, 'low': {'type': 'string'}, 'vpp': {'type': 'string'},
                              'dc': {'type': 'string'}, 'duty': {'type': 'string'}, 'phase': {'type': 'string'},
                              'level': {'type': 'string', 'description': "dc level, e.g. '1.2V'"},
-                             'cal': {'type': 'boolean', 'description': "apply this unit's calibration file (installed with 'openm454 cal import'): corrected volts, trigger level, threshold and generator levels; default false (the result's applied.cal says what was corrected)"}}, ['action'])},
+                             'cal': {'type': 'boolean', 'description': "apply this unit's calibration file (installed with 'openm454 cal import'): corrected volts, trigger level, threshold and generator levels. Default: true when a calibration table that corrects something is installed (status shows cal.installed), else false; pass false only when raw, uncorrected values are wanted (the result's applied.cal says what was corrected)"}}, ['action'])},
     {'name': 'log_plan', 'title': 'Plan a gap-free log',
      'description': 'Plan a gap-free loop-mode log without touching the scope: data rate, verdict, gap-free limit, '
                     'storage, and above the readout limit the comparison with stream (STREAM_BETTER / NEEDS_FORCE '
@@ -497,14 +500,26 @@ def _flag(flag, value):
     return [flag + '=' + value] if value.startswith('-') else [flag, value]
 
 
+def cal_wanted(a):
+    """Whether a tool call applies the calibration: what the caller said, else whether a table that corrects
+    something is installed (agents forgot to ask for it; raw values are the exception, so they are the opt-out)."""
+    v = a.get('cal')
+    if v is None:
+        from . import calib
+        return calib.installed() is not None
+    return bool(v)
+
+
+def _cal(a):
+    return ['--cal'] if cal_wanted(a) else []
+
+
 def _vertical(a):
     out = []
     for k in ('vdiv', 'offset', 'probe', 'coupling', 'bw20', 'threshold'):
         if a.get(k) not in (None, ''):
             out += _flag('--' + k, a[k])
-    if a.get('cal'):
-        out.append('--cal')
-    return out
+    return out + _cal(a)
 
 
 def _opt(a, key, flag=None):
@@ -556,13 +571,13 @@ def awg_args(a):
     if act == 'dc':
         if not a.get('level') or set(extra) - {'level'}:
             raise ToolError('INVALID_ARG', "awg dc takes only level, e.g. '1.2V'")
-        return ['awg', 'dc', '--level', str(a['level'])] + (['--cal'] if a.get('cal') else [])
+        return ['awg', 'dc', '--level', str(a['level'])] + _cal(a)
     if a.get('level'):
         raise ToolError('INVALID_ARG', 'level is for action dc', 'awg set takes wave, freq, high/low (or vpp, dc)')
     args = ['awg', 'set']
     for k in ('wave', 'freq', 'high', 'low', 'vpp', 'dc', 'duty', 'phase'):
         args += _opt(a, k)
-    return args + (['--cal'] if a.get('cal') else [])
+    return args + _cal(a)
 
 
 def record_args(a, plan=False):
@@ -719,6 +734,12 @@ class Server:
             doc, err = e.doc, True
         except Exception as e:                   # noqa: BLE001 - reported to the client, the server keeps running
             doc, err = {'ok': False, 'error': {'code': 'INTERNAL', 'message': repr(e)}}, True
+        e = doc.get('error') if isinstance(doc, dict) else None
+        if err and isinstance(e, dict) and str(e.get('code', '')).startswith('CAL_') \
+                and isinstance(args, dict) and args.get('cal') is None:
+            e['hint'] = ((e.get('hint') + '; ') if e.get('hint') else '') + \
+                'the calibration was applied by default because a table is installed: pass cal:false for ' \
+                'uncorrected values'
         if mid in self.cancelled:
             return
         result = {'content': [{'type': 'text', 'text': self.text(doc)}], 'isError': err}
@@ -759,6 +780,11 @@ class Server:
                 if doc.get('timing'):            # a shortened capture spacing (OPENM454_TIMING) applies to every call
                     short['timing'] = doc['timing']
                 doc = short
+            from . import calib
+            table = calib.installed()
+            doc['cal'] = ({'installed': True, 'unit_id': table.get('unit_id'), 'created': table.get('created'),
+                           'default': 'applied by capture, log_plan, record_start and awg unless cal:false'}
+                          if table is not None else {'installed': False, 'default': 'not applied'})
             return doc
         if name == 'capture':
             args = capture_args(a)

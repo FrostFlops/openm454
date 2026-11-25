@@ -39,6 +39,7 @@ CODES_PER_DIV = 235.0 / 8.0
 ANALOG_GAIN = (0.8, 1.25)
 ANALOG_ZERO_LSB = 30.0
 ANALOG_SLOPE = 2.0
+BW20_GAIN = (0.9, 1.02)          # optional bw20_gain: the 20 MHz limit's own factor on the gain, per mode
 AWG_GAIN = (0.9, 1.1)
 AWG_OFFSET_V = 0.1
 THR_GAIN = (0.8, 1.2)
@@ -58,6 +59,7 @@ def placeholder():
             'note': 'neutral placeholder: gain 1 and every offset 0 (no correction); replace the entries with values '
                     'measured on your unit against a reference meter',
             'analog': {m: {c: {v: dict(NEUTRAL_ENTRY) for v in VDIV_KEYS} for c in CHANNELS} for m in MODES},
+            'bw20_gain': {m: 1.0 for m in MODES},
             'awg': {'gain': 1.0, 'offset_v': 0.0},
             'threshold': {'gain': 1.0, 'offset_v': 0.0}}
 
@@ -116,6 +118,16 @@ def validate(doc):
                     p.append('%s: zero_lsb must be within +-%g' % (where, ANALOG_ZERO_LSB))
                 if not _num(s) or abs(s) > ANALOG_SLOPE:
                     p.append('%s: offset_slope_lsb_per_div must be within +-%g' % (where, ANALOG_SLOPE))
+    bw = doc.get('bw20_gain')
+    if bw is not None:
+        if not isinstance(bw, dict):
+            p.append('bw20_gain must be an object')
+        else:
+            for m, g in bw.items():
+                if m not in MODES:
+                    p.append('bw20_gain mode %r unknown (use %s)' % (m, ', '.join(MODES)))
+                elif not _num(g) or not BW20_GAIN[0] <= g <= BW20_GAIN[1]:
+                    p.append('bw20_gain.%s must be %g .. %g' % (m, BW20_GAIN[0], BW20_GAIN[1]))
     for key, gb, ob in (('awg', AWG_GAIN, AWG_OFFSET_V), ('threshold', THR_GAIN, THR_OFFSET_V)):
         e = doc.get(key)
         if e is None:
@@ -165,6 +177,17 @@ def active(path=None):
     return doc
 
 
+def installed(path=None):
+    """The calibration in force when it is usable and corrects something, else None. Never raises: a missing,
+    unreadable, invalid or neutral file is 'no calibration'. For defaults and hints (the MCP server applies an
+    installed table unless told not to); --cal itself still reports CAL_MISSING / CAL_INVALID."""
+    try:
+        doc = active(path)
+    except DscopeError:
+        return None
+    return None if neutral(doc) else doc
+
+
 def save(doc, path=None):
     """Write atomically (validated first)."""
     path = path or PATH
@@ -203,6 +226,8 @@ def neutral(doc):
             for e in vd.values():
                 if (e.get('gain', 1.0), e.get('zero_lsb', 0.0), e.get('offset_slope_lsb_per_div', 0.0)) != (1.0, 0.0, 0.0):
                     return False
+    if any(g != 1.0 for g in (doc.get('bw20_gain') or {}).values()):
+        return False
     for key in ('awg', 'threshold'):
         e = doc.get(key) or {}
         if (e.get('gain', 1.0), e.get('offset_v', 0.0)) != (1.0, 0.0):
@@ -237,13 +262,26 @@ def analog_entry(doc, mode, ch, vdiv_v):
     return None, None, 'no entry for %s at %s V/div: uncorrected' % (ch, k)
 
 
-def corrected_scale(base, entry, mode, reason=None, coupling='dc', bw20=False):
+def bw20_gain(doc, mode):
+    """The factor by which the 20 MHz limit changes a channel's gain in this channel-count mode, or None when the
+    table does not say. The limit lowers the gain at every frequency, DC included, by an amount that depends on
+    how many analog channels are on (measured 2026-11-25 on one unit: 0.978 with one analog channel, 0.989 with
+    two, 0.994 with three or four)."""
+    g = (doc.get('bw20_gain') or {}).get(mode)
+    return float(g) if _num(g) else None
+
+
+def corrected_scale(base, entry, mode, reason=None, coupling='dc', bw20=False, bw20_gain=None):
     """The scale entry with the correction folded in. base: {'zero_code' (the integer offset DAC zero),
     'vdiv_v', 'volts_per_code', 'probe'}; the effective zero_code / volts_per_code make every reader corrected and
-    the raw values stay in 'cal'."""
+    the raw values stay in 'cal'. bw20_gain: the table's factor for the 20 MHz limit in the channel-count mode in
+    use (applied only when bw20 is on)."""
     z, vpc = float(base['zero_code']), float(base['volts_per_code'])
     od = (128.0 - z) / CODES_PER_DIV
     g = float(entry['gain'])
+    fg = float(bw20_gain) if (bw20 and bw20_gain) else None
+    if fg:
+        g *= fg
     zl = float(entry.get('zero_lsb', 0.0))
     sl = float(entry.get('offset_slope_lsb_per_div', 0.0))
     s = dict(base)
@@ -251,11 +289,16 @@ def corrected_scale(base, entry, mode, reason=None, coupling='dc', bw20=False):
     s['volts_per_code'] = vpc / g
     s['cal'] = {'applied': True, 'mode': mode, 'gain': g, 'zero_lsb': zl, 'offset_slope_lsb_per_div': sl,
                 'offset_div': round(od, 6), 'zero_code_raw': base['zero_code'], 'volts_per_code_raw': vpc}
+    if fg:
+        s['cal']['bw20_gain'] = fg                  # already inside 'gain'
     if reason:
         s['cal']['note'] = reason
     if coupling != 'dc' or bw20:
         s['cal']['note'] = ((s['cal'].get('note') + '; ') if s['cal'].get('note') else '') + \
             'measured with DC coupling and full bandwidth (AC/BW20 shift the zero by up to about 1 LSB)'
+        if bw20 and not fg:
+            s['cal']['note'] += ('; the 20 MHz limit lowers the gain by about 0.6 % (3-4 analog channels) to 2.2 % '
+                                 '(one channel): not corrected, the table has no bw20_gain for this mode')
     return s
 
 

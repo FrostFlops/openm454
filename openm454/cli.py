@@ -120,7 +120,9 @@ def _vertical_args(p):
                                                   "(default 0V); at most about +/-4.3 x V/div, a larger one is clamped "
                                                   "with a warning; write --offset=-1.5V for a negative value")
     g.add_argument('--coupling', default='dc', help="'dc' (default) or 'ac', or per channel 'A1=ac'")
-    g.add_argument('--bw20', default='', help='analog channels with the 20 MHz bandwidth limit, e.g. A1,A2 (default none)')
+    g.add_argument('--bw20', default='', help='analog channels with the 20 MHz bandwidth limit, e.g. A1,A2 (default none); '
+                        'its corner depends on the analog channels on: about 16.5 MHz with one, 24.5 MHz '
+                        'with two, above 30 MHz with three or four')
     g.add_argument('--invert', default='', help='analog channels to invert, e.g. A2 (default none)')
     g.add_argument('--probe', default=None, help="probe attenuation: '10x' or per channel 'A2=10x' (default 1x); "
                                                  "--vdiv, --offset and trigger levels are then at the probe tip")
