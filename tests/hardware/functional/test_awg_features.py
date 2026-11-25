@@ -76,9 +76,24 @@ def test_a_sweep_shortens_the_period(bench, scope):
     edges = cap.measure(link.channel, edges_n=400).get('edges_rise_s') or []
     assert len(edges) > 40
     gaps = [b - a for a, b in zip(edges, edges[1:])]
-    half = len(gaps) // 2
-    assert statistics.median(gaps[:half]) > statistics.median(gaps[half:]), \
-        'an up sweep has to shorten the period, not lengthen it'
+    # The 20 ms window is not aligned with the 20 ms sweep, so it always holds one restart (back to 1 kHz) at a random
+    # place; comparing the two halves of the window failed whenever the restart fell in the second half (5 of 10 runs).
+    # Split at the restarts (a period that jumps up by 1.5x) and judge each stretch of the sweep on its own.
+    segments, cur = [], [gaps[0]]
+    for prev, g in zip(gaps, gaps[1:]):
+        if g > 1.5 * prev:
+            segments.append(cur)
+            cur = []
+        cur.append(g)
+    segments.append(cur)
+    long_ = [s for s in segments if len(s) >= 10]
+    assert long_, 'no stretch of the sweep with 10 periods between restarts: %s' % [len(s) for s in segments]
+    for s in long_:
+        half = len(s) // 2
+        assert statistics.median(s[:half]) > statistics.median(s[half:]), \
+            'an up sweep has to shorten the period, not lengthen it'
+    # one full sweep period is in the window: both ends of 1 kHz .. 10 kHz show up
+    assert min(gaps) < 0.2e-3 and max(gaps) > 0.5e-3, 'periods %.3g .. %.3g s' % (min(gaps), max(gaps))
 
 
 def test_am_modulation_shows_an_envelope(bench, scope):
