@@ -12,12 +12,7 @@ def _wiring_confirmed(request):
     a physical bench that may have been rewired since it was written. A run needs the owner's confirmation for this
     run (--bench-confirmed); there is no environment variable or saved state for it on purpose."""
     if not request.config.getoption('--bench-confirmed'):
-        d = benchmod.load()
-        links = ['%s: %s' % (k, v.get('summary', '')) for k, v in sorted(d.get('links', {}).items())]
-        pytest.exit('the hardware suite assumes the bench is wired as tests/hardware/bench.json declares:\n  %s\n'
-                    'ask the bench owner whether it is wired exactly like that right now, and only then rerun with '
-                    '--bench-confirmed (never assume the wiring was kept since the last run)'
-                    % '\n  '.join(links or ['(no links declared)']), returncode=1)
+        pytest.exit(benchmod.wiring_gate_message('the hardware suite'), returncode=1)
 
 
 @pytest.fixture(scope='session')

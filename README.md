@@ -67,11 +67,55 @@ python -m openm454 selftest
 
 | Command | How it records | Length | Rates |
 |---|---|---|---|
-| `capture` | into the 512 MiB sample memory, read out afterwards (250-265 MB/s) | one record: 400M samples per channel / 512 MiB | up to 400 MSa/s (1 channel) |
+| `capture` | into the 512 MiB sample memory, read out afterwards (287 MB/s sustained, see the ceiling below) | one record: 400M samples per channel / 512 MiB | up to 400 MSa/s (1 channel) |
 | `stream` | every record is sent while it is acquired, at any data rate (`--record-first`: above 102.4 MB/s acquire it first and read it out afterwards, as DSWave does); longer than one record or `--duration forever`: record after record, each refreshing the previous one | unlimited; between records ~0.2 s while the readout keeps up, plus the rest of the record above it (0.7 s at 250 MB/s; 2.4 s with `--record-first`); the last record is kept (`--save-each`: all) | as `capture`: analog and digital at their own rates |
 | `log` | loop mode: one endless gap-free stream, kept in RAM (default; written once at the end; a RAM ring keeps the newest part of longer runs) or, with `--storage disk`, dumped in chunk files while running | until `openm454 stop` or the duration; RAM budget / disk allowance | one rate for all channels, 100 MHz / N for any integer N (1 kSa/s..100 MSa/s, e.g. 33.333 MSa/s); interleaved 200 MSa/s (<= 2 analog, <= 4 digital channels) and 400 MSa/s (<= 1 analog, <= 2 digital) |
 
-Measured on the M454 over USB 3 with every input on a 1 kHz square, every period checked for gaps (2026-11-01/02):
+### Readout ceiling (measured 2026-11-18)
+
+One Linux host: kernel 7.3.4, xHCI, usbfs 1000 MiB, the M454 on a 5 Gbps root-hub port.
+
+| what | measured |
+| --- | --- |
+| 1 analog at 400 MSa/s (400 MB/s produced) | **287 MB/s**; the planned 1.2 s window (480 MB) took 1.675 s of wall time to read and ended 194 MB behind |
+| 2 analog at 200 MSa/s (400 MB/s produced) | 287 MB/s |
+| 2 analog + 8 digital at 100 MSa/s (300 MB/s on the wire) | 287 MB/s |
+| 4 analog + 8 digital at 50 MSa/s (250.8 MB/s on the wire) | **207 MB/s**, 67 MB of backlog in 1.2 s |
+| read out after the record instead of streaming (1 analog at 400 MSa/s, 200 MB) | 283.6 MB/s |
+| pacing at the ceiling | 1.05 MB every 3.68 ms (382 transfers in 1.396 s), 15 of the 16 queued reads always in flight |
+| unchanged by | kernel 7.2.15 -> 7.3.4, xHCI bus 004 -> 002, usbfs 16 -> 1000 MiB, read size 256 KiB .. 2 MiB, queue depth 4 .. 16 |
+
+A `log`/`record` duration is enforced on the **bytes read** (the planned window), not on the wall clock: when the
+produced rate is above the readout rate the run keeps going until the host has read that window, so the ring ends up
+holding `(D - R) x wall time` — 194 MB here, which is why the arithmetic `(400 - 287) x 1.2 s` does not reproduce it.
+
+Two different numbers, and the driver reports the second: the device's own wire rate is
+`rate x (analog channels + digital channels / 8)` bytes/s (measured against signal time: 200.1 MB/s for 4 analog at
+50 MSa/s, 250.8 MB/s for 4 analog + 8 digital at 50 MSa/s, 50.0 MB/s for 8 digital at 50 MSa/s — the model holds to
+0.5 %), while `host_mb_s` is what the host actually sustained. When a set produces more than the readout can move,
+the difference waits in the sample memory; when a set is *below* the ceiling but still falls behind (the 4 analog +
+8 digital row), the readout itself is configuration dependent — why twelve channels top out below ten is open.
+The host was never short of work (15 of the 16 queued reads in flight at every completion), so the host-side stack
+is the wrong place to look — that is not proof that the device is the limit, only that nothing above it is waiting.
+
+`bench`'s readout probe is a short sample of the same thing: it reported 206 MB/s for the set that sustains
+207 here (4 analog + 8 digital) and 267 MB/s for the one that sustains 287 (2 analog + 8 digital).
+
+Planning does not need a static ceiling: when this channel set has been measured at **another sample rate** the
+lowest *full* measurement is used (the readout follows the channel set far more than the rate). A run in which the
+host merely kept up measures the rate it produced, not the readout, so it is treated as a floor: it decides whether
+the host can keep up, and it can raise the 190 MB/s planning ceiling, but a plan is never refused on it. A set with
+no measurement at all falls back to the ceiling. A run still probes the exact configuration before it starts; the
+plan says `provisional` while it does.
+
+What a channel configuration costs the signal itself is a separate question, measured the same way (300 records per
+configuration in four sessions, rate-matched, paired differences with 95 % intervals): see
+[docs/SIGNAL-QUALITY.md](docs/SIGNAL-QUALITY.md). Above two analog
+channels the differences stay below one code (1 LSB = 1.7 mV at 0.05 V/div); enabling the eight digital channels
+changes nothing measurable; the one-channel mode is a different acquisition path (1.0 % higher gain, 0.5 LSB
+interleave mismatch, 0.5 LSB lower noise).
+
+Earlier measurements (2026-11-01/02), kept as recorded — every input on a 1 kHz square, every period checked for gaps:
 
 - The data rate is rate x (analog channels + digital channels / 8) bytes/s.
 - `stream`: real time at DSWave's 100 MB/s ceiling and at 200 MB/s. At 400 MB/s the readout ran at 270-290 MB/s and

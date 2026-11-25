@@ -39,9 +39,7 @@ def test_log_soak(bench, scope, soak, duration, soak_cfg, tmp_path, disk_guard):
         'files': {'value': files, 'ok': files >= runs},          # disk storage: <out_stem>/ with chunks + index
         'samples': {'value': samples, 'ok': samples == runs * int(record_s * rate)},
         'bytes_written': {'value': written, 'ok': written > 0},
-        'rss_growth_mib': {'value': growth['rss_mib'],
-                           'ok': growth['rss_mib'] is None
-                           or growth['rss_mib'] <= float(soak_cfg.get('rss_growth_mib', 32))},
+        'rss_after_warmup_mib': soakmod.net_growth(rss, float(soak_cfg.get('rss_after_warmup_mib', 32))),
         'rss_steady_mib': soakmod.steady_growth(rss, float(soak_cfg.get('rss_steady_mib', 8)),
                                                        int(soak_cfg.get('rss_steady_min_samples', 40))),
         'fds': {'value': growth['fds'], 'ok': growth['fds'] in (None, 0)},

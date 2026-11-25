@@ -330,9 +330,20 @@ class Job:
             time.sleep(0.1)
         return True
 
+    PROGRESS_KEYS = ('started', 'probe')          # 'ok' lines the CLI prints before the result exists
+
     def final(self):
-        lines = _read_lines(self.path)
-        return lines[-1] if lines and 'ok' in lines[-1] else None
+        """The recording's result line, or None while it is still running.
+
+        'log' emits {'ok': true, 'cmd': 'log', 'started': true} right after its plan and a 'probe' line when it
+        measures the readout, so the last line carrying 'ok' is not the result: a server restarted between the start
+        and the first statistics read the start message as the outcome, reported running: false, and then answered
+        record_stop with success without ever writing a stop request while the recording kept going.
+        """
+        for line in reversed(_read_lines(self.path)):
+            if 'ok' in line and not any(k in line for k in self.PROGRESS_KEYS):
+                return line
+        return None
 
     def save(self):
         with open(os.path.join(JOBS_DIR, self.job + '.json'), 'w') as f:

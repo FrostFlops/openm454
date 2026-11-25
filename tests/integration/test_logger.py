@@ -102,6 +102,186 @@ def test_measured_readout_replaces_the_assumed_one():
     assert make_plan(['A0', 'A1', 'A2'], ['D%d' % i for i in range(5)], 50e6, None)['verdict'] == 'sustained'
 
 
+def test_the_engine_delivers_nothing_after_it_says_stop(monkeypatch):
+    """The logger's side of the stop: it freezes the model on the pass its flag says yes, and nothing follows.
+
+    This drives the logger over a scope double, so it says nothing about the engine loop; the production loop is
+    pinned by tests/stateful/test_acquire_sim.py::test_nothing_is_delivered_after_the_stop_flag_says_yes.
+    """
+    updates, stops = [], []
+    real_update, real_stop = logger.BacklogMeter.update, logger.BacklogMeter.stop
+
+    def traced_update(self, now, received):
+        updates.append(now)
+        return real_update(self, now, received)
+
+    def traced_stop(self, now):
+        real_stop(self, now)
+        stops.append(now)
+    monkeypatch.setattr(logger.BacklogMeter, 'update', traced_update)
+    monkeypatch.setattr(logger.BacklogMeter, 'stop', traced_stop)
+    pl = make_plan(*A2D8, 20e6, 5)
+    _layout, _an, _dg, stream = fake_signal(pl, 1.0)
+    calls = {'n': 0}
+
+    def stop_flag():
+        calls['n'] += 1
+        return calls['n'] > 2                     # stop while the ring still holds data
+    res = logger.run(FakeScope(stream, pl['packet_bytes']), settings(*A2D8), pl, None, stop_flag=stop_flag)
+    assert res['acq']['stop_reason'] == 'stop_request' and calls['n'] > 2
+    assert stops, 'the stop wrapper has to freeze the model when it says yes'
+    late = [now for now in updates if now > min(stops)]
+    assert not late, 'the engine must not feed the model after the stop: it returns on that pass'
+
+
+def test_a_lower_bound_at_another_rate_cannot_refuse_a_run_the_hardware_keeps_up_with():
+    """A run where the host kept up records the rate it produced, not the readout: it is a floor, not a ceiling.
+
+    Offline reproduction from the review: 4 analog + 8 digital at 50 MSa/s (250 MB/s of data) planned for 4.5 s. With
+    no cache the plan passes (6.37 s gap-free at the static ceiling); with a 166.7 MB/s lower bound cached at another
+    rate it was refused (4.02 s), while the 207.4 MB/s the same set measured elsewhere gives 9.8 s.
+    """
+    host.readout_put(host.readout_key(4, 8, 25e6), 166.7, True, 125.0)      # the host kept up at 125 MB/s
+    pl = make_plan(*A4D8, 50e6, 4.5)
+    assert pl['readout_mb_s'] == 190.0 and pl['recommendation'] == 'log'
+    assert 'floor on the readout' in pl['readout_source']
+    assert pl['gapfree_max_s'] == pytest.approx(
+        math.floor(logger.BACKLOG_STOP * 190e6 / (250e6 * 60e6) * 100) / 100, abs=0.01)
+    host.readout_put(host.readout_key(4, 8, 25e6), 207.4, False, 125.0)     # a full measurement of the set wins
+    measured = make_plan(*A4D8, 50e6, 4.5)
+    assert measured['readout_mb_s'] == 207.4 and 'floor' not in measured['readout_source']
+    assert measured['gapfree_max_s'] == pytest.approx(
+        math.floor(logger.BACKLOG_STOP * 207.4e6 / (250e6 * 42.6e6) * 100) / 100, abs=0.01)
+    host.readout_put(host.readout_key(2, 0, 100e6), 250.0, True, 200.0)     # a floor above the ceiling still counts
+    assert make_plan(['A0', 'A1'], [], 200e6, 1)['readout_mb_s'] == 250.0
+
+
+def test_a_full_measurement_within_a_tenth_of_a_percent_is_not_sustained():
+    """The review's case: another rate of this set measured 49.98 MB/s, the run will produce 50 MB/s.
+
+    The 1e-3 allowance belongs to the cache's three decimals and to a same-rate "the host kept up"; applied to a full
+    measurement it hid a 20 kB/s deficit that fills the backlog guard in ~7 h (0.1 % of 125 MB/s hid ~84 min).
+    """
+    host.readout_put(host.readout_key(1, 0, 200e6), 49.98, False, 200.0)
+    pl = make_plan(['A0'], [], 50e6, 3000)
+    assert pl['verdict'] == 'burst' and pl['readout_mb_s'] == 50.0          # reported rounded to 0.1 MB/s
+    assert pl['gapfree_max_s'] == pytest.approx(math.floor(logger.BACKLOG_STOP * 49.98e6 / (50e6 * 20e3) * 100) / 100,
+                                                abs=0.01)
+    with pytest.raises(DscopeError) as refused:                    # forever: no estimate of the readout pretends it fits
+        make_plan(['A0'], [], 50e6, None)
+    assert refused.value.code == 'NEEDS_FORCE'
+
+
+def test_cli_remeasure_probes_even_below_the_sustained_rate():
+    """The review's case: 'log --remeasure' at 50 MSa/s asked for a measurement and got none, because the CLI only
+    bypassed the cache and the automatic probe rule skips everything below the sustained rate."""
+    ap = cli.build_parser()
+    base = ['log', '-c', 'A0', '--rate', '50M', '--duration', '1s', '--no-save']
+    assert cli.log_plan(ap.parse_args(base + ['--remeasure']), defer=True)[1]['_needs_probe']
+    assert not cli.log_plan(ap.parse_args(base), defer=True)[1]['_needs_probe']
+    fast = ['log', '-c', 'A0', '--rate', '200M', '--duration', '1s', '--no-save']
+    assert cli.log_plan(ap.parse_args(fast), defer=True)[1]['_needs_probe']      # the automatic rule still applies
+
+
+def test_a_measured_readout_below_the_data_rate_is_not_sustained():
+    """The 150 MB/s rule of thumb is for a set nothing is known about.
+
+    The review's case: 100 MB/s of data against a probe that read 50 MB/s. Nothing about that is sustained — the plan
+    has to report the gap-free limit, warn, and refuse a run longer than it.
+    """
+    host.readout_put(host.readout_key(1, 0, 100e6), 50.0, False, 100.0)
+    pl = make_plan(['A0'], [], 100e6, 3)
+    assert pl['verdict'] == 'burst' and pl['readout_mb_s'] == 50.0
+    assert pl['gapfree_max_s'] == pytest.approx(math.floor(logger.BACKLOG_STOP * 50e6 / (100e6 * 50e6) * 100) / 100,
+                                                abs=0.01)
+    assert pl['backlog_growth_mb_s'] == 50.0
+    with pytest.raises(DscopeError) as refused:
+        make_plan(['A0'], [], 100e6, 12)
+    assert refused.value.code == 'NEEDS_FORCE' and 'only' in refused.value.message
+    assert make_plan(['A0', 'A1'], [], 50e6, 60)['verdict'] == 'sustained'   # 100 MB/s, nothing measured
+
+
+def test_an_estimate_does_not_refuse_a_run_before_it_is_measured():
+    """The review's case: with only a cross-rate 50 MB/s cached, the CLI refused a 12 s run of 100 MB/s and never probed.
+
+    An estimate is for a configuration that has never run; refusing on it denied a run the device sustains (the same
+    set measured 100 MB/s with --remeasure). With defer (a real log) the plan now asks for the probe instead.
+    """
+    host.readout_put(host.readout_key(1, 0, 200e6), 50.0, False, 200.0)      # another rate: 50 MB/s measured
+    pl = make_plan(['A0'], [], 100e6, 12, defer=True)
+    assert pl['_needs_probe'] and pl['provisional'] and pl['readout_mb_s'] == 50.0
+    assert 'probe' in pl['readout_source']
+    with pytest.raises(DscopeError) as refused:                              # probe=False means never: refuses
+        make_plan(['A0'], [], 100e6, 12, defer=True, probe=False)
+    assert refused.value.code == 'NEEDS_FORCE'
+    host.readout_put(host.readout_key(1, 0, 100e6), 50.0, False, 100.0)      # this rate measured: the refusal stands
+    with pytest.raises(DscopeError) as measured:
+        make_plan(['A0'], [], 100e6, 12, defer=True)
+    assert measured.value.code == 'NEEDS_FORCE'
+
+
+def test_a_rounded_cache_still_counts_as_kept_up():
+    """The review's case: 33.333333 MB/s of data confirmed kept up, cached as 33.333 MB/s (three decimals).
+
+    data_bps > R then fired before the rounding tolerance, so a forever run was refused on a 0.000033 MB/s difference.
+    Both sides now compare with the same tolerance the kept-up rule uses.
+    """
+    first = make_plan(['A0'], [], 33.333e6, None)
+    key, data_bps = first['_readout_key'], first['_data_bps']
+    host.readout_put(key, round(data_bps / 1e6, 3), True, data_bps / 1e6)                     # stored rounded down
+    host.readout_put(host.readout_key(1, 0, 200e6), round(data_bps / 1e6, 3) - 3.0, False, 200.0)
+    pl = make_plan(['A0'], [], 33.333e6, None)
+    assert pl['verdict'] == 'sustained' and pl['gapfree_max_s'] is None and pl['recommendation'] == 'log'
+    assert data_bps > pl['readout_mb_s'] * 1e6, 'the case is only interesting when the cache rounds below the data'
+
+
+def test_this_rates_own_measurement_wins_over_another_rates():
+    """The review's case: a set that kept up here at 250 MB/s must not be refused because another rate of the same set
+    measured 207.4 MB/s. A cross-rate value is an estimate for a configuration that has never run; once this rate has
+    its own run (kept up at 250 MB/s means the readout is at least 250), that is the evidence that counts."""
+    host.readout_put(host.readout_key(4, 8, 50e6), 250.0, True, 250.0)       # this rate kept up at 250 MB/s
+    assert make_plan(*A4D8, 50e6, 12)['verdict'] == 'sustained'
+    host.readout_put(host.readout_key(4, 8, 100e6), 207.4, False, 500.0)     # another rate's full measurement
+    pl = make_plan(*A4D8, 50e6, 12)
+    assert pl['readout_mb_s'] == 250.0 and pl['verdict'] == 'sustained' and pl['gapfree_max_s'] is None
+    assert 'floor on the readout' in pl['readout_source']
+
+
+def test_a_measurement_of_the_same_set_at_another_rate_is_used():
+    """The readout depends on the channel set far more than on the rate: 2 analog + 8 digital measured 287 MB/s at
+    200 MSa/s is the right planning value for 100 MSa/s, where the static 190 MB/s ceiling would refuse a run the
+    hardware sustains."""
+    host.readout_put(host.readout_key(2, 8, 200e6), 287.0, False, 400.0)
+    pl = make_plan(*A2D8, 100e6, 10)                        # 300 MB/s of data against 287 measured
+    assert pl['readout_mb_s'] == 287.0
+    assert 'another rate' in pl['readout_source'] and 'assumed' not in pl['readout_source']
+    assert pl['verdict'] == 'burst' and pl['recommendation'] == 'log'
+    assert pl['gapfree_max_s'] == pytest.approx(
+        math.floor(logger.BACKLOG_STOP * 287e6 / (300e6 * 13e6) * 100) / 100, abs=0.01)
+    deferred = make_plan(*A2D8, 100e6, 10, defer=True)
+    assert deferred['_needs_probe'] and deferred['provisional']   # good enough to plan, still measured at the start
+    # the slowest cached rate of the set wins: a slow measurement must not flatter a faster plan
+    host.readout_put(host.readout_key(2, 8, 50e6), 210.0, False, 150.0)
+    assert make_plan(*A2D8, 100e6, 2)['readout_mb_s'] == 210.0
+    assert make_plan(*A2D8, 100e6, 2)['gapfree_max_s'] == pytest.approx(
+        math.floor(logger.BACKLOG_STOP * 210e6 / (300e6 * 90e6) * 100) / 100, abs=0.01)
+
+
+def test_another_channel_set_does_not_supply_the_readout():
+    host.readout_put(host.readout_key(4, 8, 100e6), 200.0, False, 500.0)
+    pl = make_plan(*A2D8, 100e6, 10, force=True)            # 2 analog + 8 digital has no measurement at all
+    assert pl['readout_mb_s'] == logger.CEILING_BPS / 1e6 and 'assumed' in pl['readout_source']
+
+
+def test_the_other_rate_lookup_takes_the_lowest_and_ignores_other_sets():
+    host.readout_put(host.readout_key(2, 0, 400e6), 287.0, False, 400.0)
+    host.readout_put(host.readout_key(2, 0, 100e6), 260.0, False, 200.0)
+    host.readout_put(host.readout_key(4, 0, 100e6), 120.0, False, 400.0)
+    near = host.readout_get_any_rate(2, 0)
+    assert near['mb_s'] == 260.0 and near['key'] == host.readout_key(2, 0, 100e6)
+    assert host.readout_get_any_rate(3, 0) is None
+
+
 def test_unmeasured_readout_is_deferred_to_a_probe():
     pl = make_plan(*A2D8, 100e6, 10, defer=True)                           # no refusal yet: R is measured first
     assert pl['provisional'] and pl['_needs_probe'] and 'probe' in pl['readout_source']

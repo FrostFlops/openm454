@@ -32,7 +32,7 @@
     "external signal source -> any channel"
   ],
   "soak": {
-    "_readme": "Budgets and thresholds of the long-run group. Durations are tiers; --soak-seconds overrides the tier for one run. Every number here is a check the run asserts, not a comment. rss_growth_mib bounds the whole run (it includes the allocator warm-up: measured 26 MiB over the first 15 open/close cycles); rss_steady_mib is the leak check, taken inside the last quarter of the run.",
+    "_readme": "Budgets and thresholds of the long-run group. Durations are tiers; --soak-seconds overrides the tier for one run. Every number here is a check the run asserts, not a comment. rss_after_warmup_mib bounds the growth left after the allocator warm-up, measured as the median of the last quarter of the samples against the first quarter (a cold stream process climbs 57 -> 119 MiB in that first quarter, a warm one grows 0.4 MiB over the whole run); rss_steady_mib is the leak check: inside the last quarter it takes the median pairwise slope (a climb every pair agrees on) and the level at the end of the quarter against the higher of its start and the peak the run already reached (a step that stays, each end at least three samples so one sample is a spike), reports the larger, and a release is negative in both and floors at zero; growth below the earlier peak is the allocator's swing, not growth. It judges nothing below rss_steady_min_samples: the 60 s tier has 12-162 samples, and there the knee (26 MiB over the first ~15 cycles) and the ~1.5 MiB per-cycle staircase are both larger than the 8 MiB bound — the same bench measured 32-42 MiB of net growth at 60 s against 11 MiB over 10 min and 1 h, so a verdict from a 60 s window would be knee, not leak.",
     "tiers": {
       "5min": 300,
       "10min": 600,
@@ -47,7 +47,7 @@
     "log_record_s": 5,
     "max_gap_ms": 50,
     "drift_tolerance": 0.01,
-    "rss_growth_mib": 64,
+    "rss_after_warmup_mib": 64,
     "open_time_drift": 0.2,
     "artifact_dir": "re/soaks",
     "require": {
@@ -55,7 +55,7 @@
       "free_disk_mib": 1024
     },
     "rss_steady_mib": 8,
-    "rss_steady_min_samples": 40,
+    "rss_steady_min_samples": 200,
     "disk_margin": 1.25
   },
   "manual": [

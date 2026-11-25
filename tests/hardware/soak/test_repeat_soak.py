@@ -41,9 +41,7 @@ def test_repeat_soak(bench, scope, soak, duration, soak_cfg):
         'max_gap_ms': {'value': round(worst_gap * 1e3, 4),
                        'ok': worst_gap * 1e3 <= float(soak_cfg.get('max_gap_ms', 50))},
         'drift': drift,
-        'rss_growth_mib': {'value': growth['rss_mib'],
-                           'ok': growth['rss_mib'] is None
-                           or growth['rss_mib'] <= float(soak_cfg.get('rss_growth_mib', 32))},
+        'rss_after_warmup_mib': soakmod.net_growth(rss, float(soak_cfg.get('rss_after_warmup_mib', 32))),
         'rss_steady_mib': soakmod.steady_growth(rss, float(soak_cfg.get('rss_steady_mib', 8)),
                                                        int(soak_cfg.get('rss_steady_min_samples', 40))),
         'fds': {'value': growth['fds'], 'ok': growth['fds'] in (None, 0)},

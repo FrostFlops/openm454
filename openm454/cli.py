@@ -866,7 +866,8 @@ def _log_hook(args):
 
 def log_plan(args, zero_info=None, defer=False):
     """-> (settings, plan) of a 'log' command (offline). defer: an unmeasured readout (or --remeasure) refuses
-    nothing yet; the run measures it first."""
+    nothing yet; the run measures it first. --remeasure asks for that measurement whatever the rate, so it sets the
+    explicit probe flag instead of relying on the automatic rule (which skips everything below 150 MB/s)."""
     from .scope import vertical_from_args
     from .units import si
     from . import logger
@@ -877,7 +878,8 @@ def log_plan(args, zero_info=None, defer=False):
                      None if storage == 'none' else _log_out(args), storage,
                      int(si(args.ram, 'B', '--ram')) if args.ram else None,
                      si(args.chunk, 's', '--chunk') if args.chunk else None, zero_info=zero_info, force=args.force,
-                     keep_last=args.keep_last, defer=defer, remeasure=defer and args.remeasure)
+                     keep_last=args.keep_last, defer=defer, remeasure=defer and args.remeasure,
+                     probe=True if (defer and args.remeasure) else None)
     return st, pl
 
 

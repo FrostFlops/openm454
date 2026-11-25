@@ -1,17 +1,17 @@
 # Test suite report
 
-Measured 2026-11-17 on Linux, Python 3.14.6, `origin/main` `47fcb6c` + this branch.
-Baseline numbers are the pre-change measurement of the same commit: 823 passed, 554 skipped, 86.40 s, 26 test
-files, 8396 test LOC.
+Base measurement (the PR #8 test-architecture change, 2026-11-17, Linux, Python 3.14.6, `origin/main` `47fcb6c`);
+the current numbers of the merged tree are in the *Suite* table and in the paragraph below it. The baseline of that
+base measurement is 823 passed, 554 skipped, 86.40 s, 26 test files, 8396 test LOC.
 
 ## Suite
 
 | suite | command | result | wall time |
 | --- | --- | --- | ---: |
-| fast (PR) | `python -m pytest tests` | 832 passed, 554 skipped | **14.5 s** |
-| clean software (no skips) | `python -m pytest tests -m "not hw and not slow and not traces"` | 832 passed | **14.3 s** |
+| fast (PR) | `python -m pytest tests` | 888 passed, 554 skipped | **14.9 s** |
+| clean software (no skips) | `python -m pytest tests -m "not hw and not slow and not traces"` | 888 passed | **14.9 s** |
 | recorded material only | `python -m pytest tests -m traces` | 554 skipped without the recording | 1.9 s |
-| full offline | `python -m pytest tests -m "not hw"` | 833 passed, 554 skipped | **65.3 s** |
+| full offline | `python -m pytest tests -m "not hw"` | 889 passed, 554 skipped | **65.5 s** |
 | hw functional | `python -m pytest tests -m "hw and not hwsoak" -n 0 --bench-confirmed` | 53 passed on the AWG->A0 bench, never in CI | **24.8 s** |
 | hw soak (60 s tier) | `python -m pytest tests -m hwsoak -n 0 --soak-seconds 60 --bench-confirmed` | 4 passed, artifacts in `re/soaks/` | **245.6 s** |
 | model | `quint test specs/quint/capture.qnt --match=...` | 4 runs pass | 0.02 s |
@@ -22,18 +22,19 @@ The fast suite is the default marker set (`not hw and not slow`) under `pytest-x
 the full suite adds the `slow` test. Every one of the 554 skips is a `traces` test: it compares against the DSWave
 recording in `re/traces/S01_warm`, which .gitignore keeps out of the repository (the recorded runs contain the
 device's security key). No firmware test skips. `-m "not traces"` therefore runs the software suite with no skips
-at all (832 passed), and `-m traces` selects exactly the recorded-material group (554 today). One of them, the
+at all (888 passed), and `-m traces` selects exactly the recorded-material group (554 today). One of them, the
 sweep scenario `swp_lin_eq_5k_1s`, would skip even with the recording (every `time_step` line depends on the state
 before it); it carries the marker so the software suite has no skips at all. What the recorded material is and how it was made: `docs/TRACES.md`.
 
-Re-measured 2026-11-18 on this branch (the hardware suite split into a functional and a long-run group, wiring
-declared in `tests/hardware/bench.json`; the branch builds on the host-arrival-stamps change): fast **852 passed,
-554 skipped, 14.6 s**, full offline **853 passed, 554 skipped, 65.1 s**, hardware functional **53 passed, 24.8 s**,
-hardware soak (60 s tier) **4 passed, 245.6 s**, test LOC 8843 → 10527. The tables above stay the PR #8 measurement.
+Measured 2026-11-23 on the merged tree (0.4.0 plus `--bench-confirmed`, `docs/TRACES.md`, the two soak RSS
+checks re-based below, and the four review rounds' fixes): fast **888 passed, 554 skipped, 14.9 s**, clean
+software group **888 passed, 0 skipped**, full offline **889 passed, 554 skipped, 65.5 s**, hardware functional
+**53 passed, 24.8 s** on the AWG->A0 bench, hardware soak (60 s tier) **4 passed, 245.6 s**, test LOC 8396 → 11628.
+The two tables below stay the PR #8 measurement.
 
-## Baseline vs. now
+## Baseline vs. PR #8 (kept as that change's measurement)
 
-| metric | baseline (`47fcb6c`) | now | note |
+| metric | baseline (`47fcb6c`) | PR #8 | note |
 | --- | ---: | ---: | --- |
 | collected | 1377 | 1386 | +9: properties and the capture machine |
 | passed (fast) | 823 | 832 | |
@@ -50,7 +51,7 @@ package now owns the fakes, the USB simulator, the CLI helpers and the logger fa
 inline in three test modules). The LOC target was "measure first, then decide": the consolidation removed the
 duplicated AWG golden file and merged the DSWave loop-mode block into the runner without losing assertions.
 
-## Per directory (fast / full)
+## Per directory (fast / full, PR #8 measurement)
 
 | directory | files | LOC | tests | skipped | fast | full |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -97,10 +98,12 @@ workers skip).
 - every generator feature — sine, triangle, square duty 10/50/90 %, burst edge count, sweep period shortening, AM
   envelope, DC, off — measured by the capture, not asserted from the command;
 - the rate ceilings (400/200/100 MSa/s for 1/2/3 channels), the 1024-sample floor, and the clamp of a rate above the
-  ceiling, with the applied rate taken from the capture;
-- the capture modes: forced and triggered single, repeat forced (16 frames) and repeat triggered (8 frames, distinct
-  trigger indices), back-to-back captures that leave the device idle (the loop `watch` runs), a stream stopped on
-  request, and `log` to RAM and to disk;
+  ceiling, with the applied rate taken from the capture — plus a time-base check that goes through the signal: the
+  same declared square measures the same frequency at 1 and 10 MSa/s (relative consistency only, since the generator
+  and the sampler may share a clock);
+- the capture modes: forced and triggered single, repeat forced (16 frames) and repeat triggered (8 frames, each
+  with a trigger index and the declared rise at t = 0, and not eight copies), back-to-back captures that leave the
+  device idle (the loop `watch` runs), a stream stopped on request, and `log` to RAM and to disk;
 - trigger paths: rise and fall level triggers, the holdoff being waited out, and a level the signal never reaches
   reporting `TIMEOUT_NO_TRIGGER` (not a device error) with the scope usable afterwards;
 - the real faults: a second run reports `BUSY` while the first completes, an overdriven input is reported and the
@@ -125,23 +128,56 @@ device does it:
 
 ### Long-run group (`hwsoak`, 60 s tier for the acceptance run)
 
-4 runs, **245.9 s**, one artifact set per run in `re/soaks/` (`.meta`, `.jsonl`, `.exit`, `.err`,
+4 runs, **245.7 s**, one artifact set per run in `re/soaks/` (`.meta`, `.jsonl`, `.exit`, `.err`,
 `.summary.json`), every check's measured value in the summary:
 
 | run | what it did | measured |
 | --- | --- | --- |
-| repeat | 49 captures x 512 frames | 25 088 frames, worst frame gap 2.16 ms, interval drift 0.007 %, RSS steady 0.0 MiB |
-| stream | 163 records of 200 ms, 815 statistics rows | signal clock monotone, RSS steady 1.2 MiB |
-| log | 12 records x 5 s, to disk | 60 000 000 samples, 60.0 MB written, RSS steady 0.25 MiB |
-| lifecycle | open -> capture -> close, 63 cycles | open median 769.5 ms, open-time drift 0.11 %, RSS steady 6.2 MiB |
+| repeat | 49 captures x 512 frames | 25 088 frames, worst frame gap 2.17 ms, RSS +0.05 MiB after the warm-up, steady `insufficient_data` (49 samples) |
+| stream | 162 records of 200 ms, 810 statistics rows | signal clock monotone, RSS +6.20 MiB after the warm-up, steady `insufficient_data` (162 samples) |
+| log | 12 records x 5 s, to disk | 60 000 000 samples in 24 files, RSS +0.00 MiB after the warm-up, steady `insufficient_data` (12 samples) |
+| lifecycle | open -> capture -> close, 63 cycles | open median 768.7 ms, RSS +41.01 MiB after the warm-up (the knee spans the 60 s tier's first quarter), steady `insufficient_data` (63 samples) |
 
 Every run also asserts: no error row, frames/records counted, file descriptors and threads unchanged, the device
-released and usable afterwards. Tiers are 5/10/60 min in `bench.json`; `--soak-seconds` overrides one run. The RSS
-check that matters is the steady-state one inside the last quarter: 21 open/close cycles grow RSS by 26 MiB over the
-first ~15 and then stay flat (measured), so the whole-run total is reported but only the steady growth fails a run.
-That check is tri-state — `pass` / `fail` / `insufficient_data` — and needs at least 40 samples: at the 60 s tier the
-log run has 12 and reports `insufficient_data` rather than counting as verified, while the other three pass. The
-10 min and 1 h tiers have enough points for all four.
+released and usable afterwards. Tiers are 5/10/60 min in `bench.json`; `--soak-seconds` overrides one run.
+
+Two RSS checks, and neither may read allocator behaviour as a leak. 21 open/close cycles grow RSS by 26 MiB over the
+first ~15 and then stay flat (measured), and a cold stream process climbs 57 -> 119 MiB over its first records, so
+the growth of a whole short run is warm-up, not drift: `rss_after_warmup_mib` therefore compares the median of the
+last quarter of the samples against the median of the first quarter and bounds what is left. The leak check is
+`rss_steady_mib`, the larger of two robust terms inside the last quarter: the median pairwise slope times its span
+(a slow climb every pair agrees on is reported at nearly its full height) and the median of the quarter's last tenth
+against its first tenth (a step that stays is growth even when most of the quarter is still flat — 92 samples at
+100 MiB and 8 at 200 MiB is 100 MiB retained, which the slope alone reports as 0). Each tenth is at least three
+samples, so one sample above the plateau is a spike, not a step — a 63-sample 60 s lifecycle run has exactly that
+few. A release is negative in both and floors at zero: a stream run that ends by freeing 23 MiB is not a leak. Growth
+also has to be new territory: the stream run on this bench swings ~33 MiB (1.5 MiB paid per record, mostly returned),
+so a quarter that climbs without passing the peak the run already reached is recovery, not growth (measured once: a
+29.6 MiB slope in a run that ended 11 MiB under its own peak). The slope is estimated on at most 256 evenly spaced
+samples of the quarter (32 640 pairwise slopes, ~2 MiB): a 1 h stream run has ~2 400 samples in its quarter, and the
+full cross product cost 125 MiB at the end of the run for a number that the bounded estimate gives to within
+0.003 MiB. Both are tri-state — `pass` / `fail` / `insufficient_data` — and the
+steady one needs at least 200 samples, so the 60 s tier judges nothing: its runs hold 12-162 samples, and there the
+26 MiB knee and the ~1.5 MiB per-cycle staircase are both larger than the 8 MiB bound — this bench measured 32-42 MiB
+of net growth at 60 s against 11 MiB over 10 min and 1 h, so a 60 s verdict would be the knee, not a leak. All four
+report `insufficient_data` there and the run still asserts the net bound, frame/record counts, gaps, fds, threads and
+the released device. The 10 min tier has enough points for all four (measured below); the 1 h tier for the lifecycle
+run only.
+
+Measured at the default 10 min tier (2026-11-23, one session, 4 passed, 2404.7 s): stream +17.40 / steady 0.00
+(1621 records), lifecycle +11.28 / steady 6.68 (626 cycles), repeat +0.06 / 0.04 (481 captures), log +0.004 / 0.00
+(116 records). The warm-up is amortised as expected — stream's whole-run growth falls from 64.4 MiB at the 60 s tier
+to 24.0 MiB here, lifecycle's from 64.1 MiB — so the old whole-run bound of 64 MiB was within 0.05 MiB of failing
+the lifecycle run at this tier for allocator reasons alone. The lifecycle series is a staircase: ~1.5 MiB per
+open/close cycle paid out and mostly released again (net ~0.024 MiB/cycle over the 470 cycles after the warm-up),
+which is why its steady value (6.68) is the one number there close to the 8 MiB bound.
+
+The 1 h tier was measured the same day on the lifecycle run (3764 cycles, 3601.8 s, passed): **+11.58 MiB** after the
+warm-up, **steady 3.86 MiB**, open time 768.8 ms median with 0.04 % drift across the hour, fds and threads unchanged.
+The staircase is not linear, so the 10 min run's ~0.024 MiB/cycle did not project: the first eighth carries the knee
+(58 -> 124 MiB) and the remaining seven climb 124 -> 137, i.e. ~0.004 MiB/cycle over 3300 cycles, with occasional
+1.5 MiB steps paid and returned (one eighth swings 11 MiB) — a projection from the shorter tier would have predicted
+~90 MiB and a failure that did not happen. Why each reopen pays ~1.5 MiB that is mostly returned later is still open.
 
 Seed defects, injected and reverted: dropping every frame's `host_s` fails the repeat run and the functional
 arrival-time test; a stop path that forgets to release the device fails `test_the_engine_is_idle_after_a_capture`,
@@ -241,7 +277,7 @@ Representative tests: `test_misfires_are_discarded_and_rearmed`,
     python -m pytest tests -m "not hw and not slow and not traces"   # software only, 0 skips
     python -m pytest tests -m traces           # the recorded-material group (needs re/traces/S01_warm)
     python -m pytest tests -m "hw and not hwsoak" -n 0 --bench-confirmed   # hardware, functional (24.8 s)
-    python -m pytest tests -m hwsoak -n 0 --soak-seconds 60 --bench-confirmed   # hardware, long runs
+    python -m pytest tests -m hwsoak -n 0 --soak-seconds 60 --bench-confirmed   # hardware, long runs (tiers in bench.json)
     quint test specs/quint/capture.qnt --main=capture --match='repeat_ok|no_trigger_ok|stream_ok|log_ok'
     apalache-mc server &                       # then:
     quint verify specs/quint/capture.qnt --main=capture --init=init --step=step --max-steps=12 \

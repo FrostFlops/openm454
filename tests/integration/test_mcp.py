@@ -93,6 +93,24 @@ FAKE = textwrap.dedent(r'''
 ''')
 
 
+SLOW = textwrap.dedent(r'''
+    import json, os, sys, time
+    args = sys.argv[1:]
+    def emit(d):
+        print(json.dumps(d), flush=True)
+    if args[0] == 'info':
+        emit({'ok': True, 'cmd': 'info', 'device': {'model': 'DSCope M454'}, 'limits': {}, 'awg_last': None})
+        sys.exit(0)
+    emit({'ok': True, 'cmd': 'log', 'started': True, 'plan': {}, 'out_stem': 'x'})    # progress, not the result
+    stop = os.environ['FAKE_STOP']
+    while not os.path.exists(stop):
+        time.sleep(0.02)
+    os.remove(stop)
+    emit({'ok': True, 'cmd': 'log', 'acq': {'stop_reason': 'stop_request', 'duration_s': 1.0, 'complete': True,
+                                           'samples': 1000000}, 'files': {}})
+''')
+
+
 @pytest.fixture
 def fake(tmp_path, monkeypatch):
     script = tmp_path / 'fake_cli.py'
@@ -247,6 +265,32 @@ def test_recordings_survive_a_server_restart(fake, tmp_path):
     assert busy['isError'] and busy['structuredContent']['error']['code'] == 'BUSY'
     stop = call(other, 'record_stop', {}, mid=3)['structuredContent']
     assert stop['ok'] and stop['job'] == job['job'] and not other.jobs[job['job']].running()
+
+
+def test_a_restart_before_the_first_statistics_keeps_the_recording_stoppable(tmp_path, monkeypatch):
+    """A recording that has only printed its start line is running, not finished.
+
+    'log' prints {'ok': true, 'started': true} before any data arrives. Reading that as the result made a restarted
+    server report running: false, answer record_stop with success, and never write a stop request while the child kept
+    recording.
+    """
+    script = tmp_path / 'slow_cli.py'
+    script.write_text(SLOW)
+    stop = tmp_path / 'stop.request'
+    monkeypatch.setattr(M, 'STOP_REQUEST', str(stop))
+    monkeypatch.setattr(M, 'JOBS_DIR', str(tmp_path / 'jobs'))
+    monkeypatch.setenv('FAKE_STOP', str(stop))
+    srv = M.Server(cli=M.Cli([sys.executable, str(script)]), out=io.BytesIO())
+    srv.version = '2025-06-18'
+    job = call(srv, 'record_start', {'mode': 'log', 'rate': '1M', 'duration': 'forever'})['structuredContent']
+    other = M.Server(cli=srv.cli, out=io.BytesIO())           # e.g. the client restarted the server
+    other.version = '2025-06-18'
+    restarted = other.jobs[job['job']]
+    assert restarted.final() is None, 'the start message is progress, not the result'
+    assert restarted.running(), 'the pid decides for a recording this server did not start'
+    stopped = call(other, 'record_stop', {'wait_s': 20}, mid=2)['structuredContent']
+    assert stopped['ok'] and stopped['job'] == job['job'] and not stopped['running']
+    assert not restarted.running()
 
 
 def test_a_crashed_recording_reports_its_stderr(fake):

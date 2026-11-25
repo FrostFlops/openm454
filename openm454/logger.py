@@ -81,6 +81,7 @@ RESTART_S = 0.18                     # measured: stop handshake, 100 ms quiet, s
                                      # (the traced spacing; restart_s() follows an OPENM454_TIMING profile)
 RECORD_SAMPLES = 400_000_000         # a stream record: at most 400M samples per channel and 512 MiB
 PROBE_S = 2.0                        # readout probe before a log above SUSTAINED_BPS whose channel set was not measured
+ROUNDING_BPS = 1e3                   # state/host.json stores MB/s with three decimals: 1 kB/s of slack, no more
 PROBE_BACKLOG = 256 * 2 ** 20        # ... ends early once the scope is this far ahead (its data are dropped anyway)
 KEPT_UP = 0.99                       # a probe reading >= this x D: the host keeps up (R >= D, a lower bound)
 SMALL_PKT_TRANSFERS = 4              # small packets: DSWave queues 1 read of one block, the driver at least this many
@@ -141,7 +142,8 @@ def loop_hal(st, rate, fold=False, divider=None):
 
 
 def plan(st, rate, duration=None, every=1.0, out_dir=None, storage='ram', ram_budget=None, chunk_s=None,
-         zero_info=None, force=False, keep_last=False, disk_budget=None, defer=False, remeasure=False):
+         zero_info=None, force=False, keep_last=False, disk_budget=None, defer=False, remeasure=False,
+         probe=None):
     """Offline plan of a loop log. duration None = until stopped. Raises INVALID_ARG for what cannot work.
     The readout while acquiring (R) depends on the channel set: it comes from state/host.json (measured by a probe
     or an earlier run), else the planning ceiling of 190 MB/s is assumed. Above R the scope's memory fills at D - R
@@ -150,7 +152,9 @@ def plan(st, rate, duration=None, every=1.0, out_dir=None, storage='ram', ram_bu
     piece (or one record holds the whole duration), else NEEDS_FORCE: log gives the longest gap-free piece, and
     force records it and stops when the scope is BACKLOG_STOP ahead (stop_reason 'ring_full'). Both errors carry
     the numbers in .plan. defer=True: with an assumed R nothing is refused (the run measures R first);
-    remeasure: ignore the cached R (with defer: measure it again before deciding).
+    remeasure: ignore the cached R (with defer: measure it again before deciding);
+    probe: True measure this channel set before the run whatever the rate, False never measure (plan with the cache
+    or the ceiling), None decide from the cache and the sustained rate.
     keep_last: a RAM log longer than the budget keeps the newest budget's worth (ring) instead of being refused.
     disk_budget: bytes a disk log may use (default: the owner's allowance in state/host.json, else 90 % of free)."""
     from .scope import _cached_zero, no_repeat
@@ -202,18 +206,50 @@ def plan(st, rate, duration=None, every=1.0, out_dir=None, storage='ram', ram_bu
     # readout while acquiring for this channel set: measured (probe / bench, cached) or the planning ceiling
     rkey = host.readout_key(na, nd, r)
     cached = None if remeasure else host.readout_get(rkey)
+    near = None if remeasure else host.readout_get_any_rate(na, nd)          # lowest: can the host keep up?
+    full = None if remeasure else host.readout_get_any_rate(na, nd, full_only=True)   # what the readout actually did
+    bound = cached or near                       # a measurement of this channel set, at this rate or another
     if cached:
-        R = cached['mb_s'] * 1e6
         rsrc = 'measured %s%s' % (cached['time'], ' (lower bound: the host kept up)' if cached['lower_bound'] else '')
+    elif near:
+        rsrc = 'measured %s at another rate of this channel set (%s)%s' % (
+            near['time'], near['key'].split('@', 1)[1], ' (lower bound: the host kept up)' if near['lower_bound'] else '')
     else:
-        R, rsrc = CEILING_BPS, 'assumed (planning ceiling)'
-    needs_probe = not cached and data_bps > SUSTAINED_BPS
-    if needs_probe and defer:
-        rsrc += '; a probe of up to %.0f s measures it when the log starts (the plan may change)' % PROBE_S
-    kept_up = bool(cached and cached['lower_bound'] and data_bps <= R * (1 + 1e-3))    # stored rounded
-    if data_bps <= SUSTAINED_BPS or kept_up or (cached and data_bps <= 0.95 * R):
+        rsrc = 'assumed (planning ceiling)'
+    # The duration maths needs an estimate of the readout itself. A run where the host kept up only proves the readout
+    # is at least what it produced, so planning on that number refuses runs the hardware sustains; it is used as a
+    # floor (never below the static ceiling) and the plan says so. This rate's own measurement wins over anything
+    # measured at another rate: a set that kept up here at 250 MB/s is not refused because another rate measured
+    # 207.4 MB/s, and its own run is the only evidence about this configuration.
+    if cached and not cached['lower_bound']:
+        R = cached['mb_s'] * 1e6
+    else:
+        estimate = full['mb_s'] * 1e6 if full else CEILING_BPS          # a full measurement of the set, or the ceiling
+        floor = cached['mb_s'] * 1e6 if cached else 0.0                 # this rate kept up: the readout is at least this
+        if near and near['lower_bound']:
+            floor = max(floor, near['mb_s'] * 1e6)                      # ... or another rate's run did
+        R = max(estimate, floor)
+        if floor:
+            rsrc += '; a lower bound of %.0f MB/s is a floor on the readout, not the readout, so the plan uses ' \
+                    '%.0f MB/s' % (floor / 1e6, R / 1e6)
+    # probe: True measures this channel set first, False never does, None decides from the cache and the sustained
+    # rate (the CLI's default). Another rate is good enough to plan, not to keep.
+    needs_probe = bool(probe) if probe is not None else (cached is None and data_bps > SUSTAINED_BPS)
+    kept_up = bool(bound and bound['lower_bound'] and data_bps <= R * (1 + 1e-3))    # stored rounded
+    # SUSTAINED_BPS is a rule of thumb for a configuration nothing is known about; a measurement of this set that came
+    # in below what the run will produce is a bottleneck whatever the rate (100 MB/s of data against a measured
+    # 50 MB/s readout is gap-free for 5 s, not sustained).
+    # The cache stores MB/s with three decimals, so a comparison needs a 1 kB/s rounding allowance — and nothing more
+    # for a full measurement, where the value is an estimate of the readout and 0.1 % of it (0.125 MB/s at 125 MB/s)
+    # would hide a real deficit that reaches the backlog guard in ~84 min. A lower bound of this same rate keeps the
+    # cache's own 1e-3: "the host kept up" describes a run, not a reading.
+    slack = R * 1e-3 if (cached and cached['lower_bound']) else ROUNDING_BPS
+    at_readout = data_bps <= R + slack
+    if bound and not at_readout:
+        verdict = 'burst'
+    elif data_bps <= SUSTAINED_BPS or kept_up or (bound and data_bps <= 0.95 * R):
         verdict = 'sustained'
-    elif data_bps <= R:
+    elif at_readout:
         verdict = 'near_limit'
         warnings.append('%.0f MB/s is near the readout limit of this channel set (%.0f MB/s, %s); the backlog is '
                         'watched and the run stops before data could be lost' % (data_bps / 1e6, R / 1e6, rsrc))
@@ -233,6 +269,13 @@ def plan(st, rate, duration=None, every=1.0, out_dir=None, storage='ram', ram_bu
         better = alt['same_rates'] and (alt['records'] == 1 or alt['record_s'] >= burst_s)
         recommendation = 'stream' if better else 'log --force'
     what = 'forever' if duration is None else '%g s' % duration
+    # An estimate must not refuse a run nobody measured: when this rate has no measurement of its own and the plan
+    # would refuse, measure this channel set first and decide on the measurement (the CLI re-plans with it). A refusal
+    # on a measurement of this rate stands, and probe=False still means never.
+    if defer and probe is not False and cached is None and too_long and not force:
+        needs_probe = True
+    if needs_probe and defer:
+        rsrc += '; a probe of up to %.0f s measures it when the log starts (the plan may change)' % PROBE_S
     if too_long and not force and not (defer and needs_probe):
         why = ('%s at %.0f MB/s: log is gap-free for the first %.2f s only (readout %.0f MB/s, %s: the scope gets '
                '%.0f MB/s ahead, and nothing can be read after a stop)' % (what, data_bps / 1e6, gapfree, R / 1e6, rsrc,
@@ -774,9 +817,22 @@ class BacklogMeter:
         self.base, self.t_base = 0.0, t_head          # at the head nothing is behind yet
         self.backlog = self.max = self.growth = 0.0
         self.hist = []
+        self.t_stop = None                            # set when the run is told to stop: production ends here
+
+    def stop(self, now):
+        """The device produces nothing after the stop request: whatever still arrives is the drain of data already in
+        the ring, so from here on the model must not keep adding D per second.
+
+        The engine loop returns as soon as its stop flag says yes, so it delivers no chunk after this point and the
+        clamp is not exercised by it (tests/integration/test_logger.py pins that: no update after the stop). It stays
+        here as the model's contract for any caller that does read the drain — the value it protects is the peak, which
+        would otherwise grow by (D - R) x drain while nothing is being produced."""
+        if self.t_stop is None:
+            self.t_stop = now
 
     def update(self, now, received):
-        raw = self.D * (now - self.t0) - received
+        t = now if self.t_stop is None else min(now, self.t_stop)
+        raw = self.D * (t - self.t0) - received
         rise = CLOCK_TOL * self.D * max(0.0, now - self.t_base) if raw - self.base < DRIFT_BAND else 0.0
         self.base = min(raw, self.base + rise)
         self.t_base = now
@@ -900,7 +956,7 @@ def run(scope, st, pl, out_stem=None, emit=None, stop_flag=None, heartbeat=None,
         if s['pend_n'] >= piece_bytes and (target is None or s['n_data'] < target):
             flush()                                  # the block that reaches the target is trimmed at the end
 
-    def stop():
+    def _stop():
         if w.error is not None:
             s['reason'] = 'hook_error' if type(w.error).__name__ == 'HookError' else 'writer_error'
             return True
@@ -937,6 +993,16 @@ def run(scope, st, pl, out_stem=None, emit=None, stop_flag=None, heartbeat=None,
             s['queued_at_stop'] = w.queued
             return True
         return False
+
+    def stop():
+        """The engine's stop flag. Freeze the backlog model's production term on the pass that says yes: the device is
+        about to stop producing, so anything read after that is the drain of data already produced. The engine returns
+        on that same pass, which makes this a no-op for the loop as it is today and keeps the model honest for a
+        caller that reads the drain."""
+        yes = _stop()
+        if yes and s['meter'] is not None:
+            s['meter'].stop(time.perf_counter())
+        return yes
 
     raw = None
     err = None

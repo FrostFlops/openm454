@@ -52,8 +52,14 @@ layers: an example/golden oracle (left) and a generated one (right). Update this
   with `--soak-seconds`). One device, one process: both need `-n 0` (the conftest fails loudly under xdist). The
   default marker set and CI never select them; only `OPENM454_NO_USB` skips — a busy or missing scope is an error,
   and the session fixture hands the generator back mode by mode (levels, duty and phase included) or parks it. The
-  long-run steady-RSS check is tri-state (`pass` / `fail` / `insufficient_data`): a short run says it cannot judge
-  instead of counting as verified. Seven of the functional checks are the device counterpart of an offline test
+  long-run steady-RSS check takes the larger of the median pairwise slope inside the last quarter and the level
+  of its last tenth against its first and the peak the run already reached, each tenth at least three samples so one
+  sample is a spike and not a step (a step that stays is growth; a release is negative growth, not a leak; a quarter
+  that climbs without passing the earlier peak is the allocator's swing, not growth) and is
+  tri-state (`pass` / `fail` / `insufficient_data`), needs 200 samples, so the 60 s tier says it cannot judge
+  (12-162 samples, less than the knee and the per-cycle staircase it would have to see past)
+  instead of counting as verified; the growth after the allocator warm-up is bounded separately, by comparing the
+  median of the first quarter of the samples with the median of the last. Seven of the functional checks are the device counterpart of an offline test
   (self-test, spacing profile and its repeat-hold invariant, calibration bound/foreign, live packet geometry and
   trigger index, save/load/analyze/plot, refusals leaving the device idle), so the offline logic and the device
   behaviour are covered by the same cases. The suite does not carry its wiring in constants: `tests/hardware/bench.json`

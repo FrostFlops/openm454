@@ -1100,7 +1100,7 @@ class Scope:
         out_dir = os.path.dirname(out_stem) if out_stem else None
         kw = dict(zero_info=self.dev.zero_info, force=force, keep_last=keep_last)
         pl = logger.plan(st, rate, duration, every, out_dir, storage, ram_budget, chunk_s, defer=probe is not False,
-                         remeasure=probe is True, **kw)
+                         remeasure=probe is True, probe=probe, **kw)
         if pl['_needs_probe']:
             logger.measure_readout(self, pl)
             pl = logger.plan(st, rate, duration, every, out_dir, storage, ram_budget, chunk_s, **kw)

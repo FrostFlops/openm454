@@ -644,6 +644,33 @@ def test_endless_run_without_buffering_stops_on_the_flag():
     assert sim.violations == [] and not sim.starved and cap.ep84 == [1, 2, 3]
 
 
+def test_nothing_is_delivered_after_the_stop_flag_says_yes():
+    """The backlog model's measurement point, in the production loop (Engine._collect, not a test double).
+
+    The logger freezes its production term on the pass its stop flag says yes; this pins why that is enough — the
+    engine returns on that same pass, so no transfer that completes during the stop handshake reaches on_chunk (a
+    scope double that stops itself cannot show this).
+    """
+    sim, eng = engine()
+    got, tripped = [], {}
+
+    def on_chunk(buf):
+        got.append(buf)
+
+    def stop_flag():
+        if len(got) >= 3:                                 # the head and two data chunks by now
+            tripped.setdefault('at', len(got))
+            return True
+        return False
+    cap = eng.run(SETUP, pkt_bytes=PKT, need_bytes=None, n_transfers=4, trigger_timeout=1.0, collect_timeout=None,
+                  on_chunk=on_chunk, stop_flag=stop_flag, poll=False, keep_data=False)
+    assert cap.stopped and cap.stop == 'normal' and cap.head is not None
+    assert tripped['at'] >= 3, 'the flag was consulted with data already delivered'
+    assert len(got) == tripped['at'], 'the engine returns on the pass that says stop: nothing arrives after it'
+    assert len(got[0]) == HEAD_BYTES and all(len(b) == PKT for b in got[1:])
+    assert sim.violations == [] and not eng.t.running
+
+
 def test_usbfs_limit_is_read_from_sysfs(tmp_path):
     p = tmp_path / 'usbfs_memory_mb'
     p.write_text('1000\n', encoding='ascii')
