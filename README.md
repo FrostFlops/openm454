@@ -73,7 +73,7 @@ python -m openm454 selftest
 
 ### Readout ceiling (measured 2026-11-18)
 
-One Linux host: kernel 7.3.4, xHCI, usbfs 1000 MiB, the M454 on a 5 Gbps root-hub port.
+One Linux host, usbfs 1000 MiB, the M454 on a 5 Gbps port.
 
 | what | measured |
 | --- | --- |
@@ -83,7 +83,7 @@ One Linux host: kernel 7.3.4, xHCI, usbfs 1000 MiB, the M454 on a 5 Gbps root-hu
 | 4 analog + 8 digital at 50 MSa/s (250.8 MB/s on the wire) | **207 MB/s**, 67 MB of backlog in 1.2 s |
 | read out after the record instead of streaming (1 analog at 400 MSa/s, 200 MB) | 283.6 MB/s |
 | pacing at the ceiling | 1.05 MB every 3.68 ms (382 transfers in 1.396 s), 15 of the 16 queued reads always in flight |
-| unchanged by | kernel 7.2.15 -> 7.3.4, xHCI bus 004 -> 002, usbfs 16 -> 1000 MiB, read size 256 KiB .. 2 MiB, queue depth 4 .. 16 |
+| unchanged by | the kernel version, the USB bus, usbfs 16 -> 1000 MiB, read size 256 KiB .. 2 MiB, queue depth 4 .. 16 |
 
 A `log`/`record` duration is enforced on the **bytes read** (the planned window), not on the wall clock: when the
 produced rate is above the readout rate the run keeps going until the host has read that window, so the ring ends up

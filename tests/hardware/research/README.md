@@ -35,8 +35,8 @@ not show.
 
 ## Each run writes a manifest
 
-`manifest-<script>.json` records the session id, the unit (model, firmware, panel, FPGA, link speed), the kernel and
-platform, the git commit, the SHA-256 prefixes of the script and of `bench.json`, and the arguments. Without it two
+`manifest-<script>.json` records the session id, the unit (model, firmware, panel, FPGA, link speed), the Python
+version, the git commit, the SHA-256 prefixes of the script and of `bench.json`, and the arguments. Without it two
 CSV files cannot be told apart from two different units or script versions.
 
 The generator is handed back at the end of both scripts (`tests/support/bench.py:restore_or_park`): the state found

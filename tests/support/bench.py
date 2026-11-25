@@ -195,7 +195,7 @@ def write_manifest(out_dir, scope, script, args, extra=None, files=(), candidate
     doc = {'session': time.strftime('%Y%m%d-%H%M%S'), 'date': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
            'script': os.path.basename(script), 'script_sha256': sha(script),
            'bench_json_sha256': sha(DECLARATION), 'git': git or None,
-           'kernel': platform.release(), 'platform': platform.platform(), 'python': platform.python_version(),
+           'python': platform.python_version(),          # no kernel or platform string: no host details in the repo
            'device': {k: dev.get(k) for k in ('model', 'fw_version', 'panel_version', 'fpga_bin_version',
                                               'usb_speed')},
            'args': {k: v for k, v in vars(args).items() if k != 'out_dir'}, 'extra': extra or {},

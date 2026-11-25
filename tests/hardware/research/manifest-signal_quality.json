@@ -25,8 +25,6 @@
   "vdiv_v": 0.05
  },
  "git": "1edb44bb1e1e9620a93e90341156f19317703363",
- "kernel": "7.3.4-arch1-2",
- "platform": "Linux-7.3.4-arch1-2-x86_64-with-glibc2.44",
  "python": "3.14.6",
  "script": "signal_quality.py",
  "script_sha256": "54d1ce1b96c54e7c",
